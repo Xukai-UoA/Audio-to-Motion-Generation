@@ -5,6 +5,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import GraphConv, GATConv
 from torch_geometric.data import Data, Batch  # 用于批量图处理
 
@@ -73,10 +74,13 @@ class SelfAttention_G(nn.Module):
             SelfAttention(out_channels)
         )
         self.body_proj_in = nn.Linear(out_channels, self.num_body_joints * self.joint_feat_dim)
-        # Multi-layer GCN with GAT for attention-based graph processing
-        self.body_gcn1 = GATConv(self.joint_feat_dim, self.joint_feat_dim, heads=4, concat=False)  # GAT for complexity
+        # Multi-layer GCN with GAT for attention-based graph processing (increased to 5 layers)
+        self.body_gcn1 = GATConv(self.joint_feat_dim, self.joint_feat_dim, heads=4, concat=False)
         self.body_gcn2 = GraphConv(self.joint_feat_dim, self.joint_feat_dim)
-        self.body_gcn3 = GATConv(self.joint_feat_dim, self.joint_feat_dim, heads=4, concat=False)  # Additional layer
+        self.body_gcn3 = GATConv(self.joint_feat_dim, self.joint_feat_dim, heads=4, concat=False)
+        self.body_gcn4 = GraphConv(self.joint_feat_dim, self.joint_feat_dim)  # Additional layer
+        self.body_gcn5 = GATConv(self.joint_feat_dim, self.joint_feat_dim, heads=4, concat=False)  # Additional layer
+        self.body_layer_norms = nn.ModuleList([nn.LayerNorm(self.joint_feat_dim) for _ in range(5)])
         self.body_relu = nn.LeakyReLU(0.2)
         self.body_dropout = nn.Dropout(p=p)
         self.body_proj_out = nn.Linear(self.num_body_joints * self.joint_feat_dim, out_channels)
@@ -96,10 +100,13 @@ class SelfAttention_G(nn.Module):
             ChannelAttention(out_channels)
         )
         self.hand_proj_in = nn.Linear(out_channels, self.num_hand_joints * self.joint_feat_dim)
-        # Multi-layer GCN/GAT for enhanced hand modeling
-        self.hand_gcn1 = GATConv(self.joint_feat_dim, self.joint_feat_dim, heads=4, concat=False)  # Upgraded to GAT
+        # Multi-layer GCN/GAT for enhanced hand modeling (increased to 5 layers)
+        self.hand_gcn1 = GATConv(self.joint_feat_dim, self.joint_feat_dim, heads=4, concat=False)
         self.hand_gcn2 = GraphConv(self.joint_feat_dim, self.joint_feat_dim)
-        self.hand_gcn3 = GATConv(self.joint_feat_dim, self.joint_feat_dim, heads=4, concat=False)  # Additional layer
+        self.hand_gcn3 = GATConv(self.joint_feat_dim, self.joint_feat_dim, heads=4, concat=False)
+        self.hand_gcn4 = GraphConv(self.joint_feat_dim, self.joint_feat_dim)  # Additional layer
+        self.hand_gcn5 = GATConv(self.joint_feat_dim, self.joint_feat_dim, heads=4, concat=False)  # Additional layer
+        self.hand_layer_norms = nn.ModuleList([nn.LayerNorm(self.joint_feat_dim) for _ in range(5)])
         self.hand_relu = nn.LeakyReLU(0.2)
         self.hand_dropout = nn.Dropout(p=p)
         self.hand_proj_out = nn.Linear(self.num_hand_joints * self.joint_feat_dim, out_channels)
@@ -117,6 +124,29 @@ class SelfAttention_G(nn.Module):
         # Example joint_subset; adjust as needed
         self.joint_subset = list(range(out_feats // 2))  # Assuming 2D poses, half for x/y
 
+    def _expand_edge_index(self, edge_index, num_nodes, batch_size):
+        """
+        Vectorized edge index expansion for efficient batch GCN processing.
+        Avoids creating individual Data objects and using Batch.from_data_list().
+
+        Args:
+            edge_index: [2, num_edges] template edge index
+            num_nodes: number of nodes per graph
+            batch_size: number of graphs in batch
+
+        Returns:
+            Expanded edge index [2, batch_size * num_edges]
+        """
+        # Create offsets for each graph in batch
+        offsets = torch.arange(batch_size, device=edge_index.device) * num_nodes
+        offsets = offsets.view(-1, 1, 1)  # [batch_size, 1, 1]
+
+        # Expand edge_index for all graphs
+        edge_index_expanded = edge_index.unsqueeze(0) + offsets  # [batch_size, 2, num_edges]
+        edge_index_expanded = edge_index_expanded.permute(1, 0, 2).reshape(2, -1)  # [2, batch_size * num_edges]
+
+        return edge_index_expanded
+
     def forward(self, audio, real_pose=None):
         # Audio encoding
         audio_feats = self.audio_encoder(audio)  # [B, 256, time_steps]
@@ -129,44 +159,98 @@ class SelfAttention_G(nn.Module):
         body_x = self.body_proj_in(body_x)  # [B, T, num_body_joints * joint_feat_dim]
         body_x = body_x.view(B * T, self.num_body_joints, self.joint_feat_dim)  # [B*T, joints, feat]
 
-        # Batch body graphs
-        body_data_list = [Data(x=body_x[i], edge_index=self.body_edge_index_template) for i in range(B * T)]
-        body_batch = Batch.from_data_list(body_data_list)
+        # Optimized batch body graphs - vectorized edge index expansion
+        body_x_flat = body_x.view(-1, self.joint_feat_dim)  # [B*T*num_joints, feat]
+        body_edge_expanded = self._expand_edge_index(
+            self.body_edge_index_template, self.num_body_joints, B * T
+        )
 
-        body_x = self.body_gcn1(body_batch.x, body_batch.edge_index)
-        body_x = self.body_relu(body_x)
-        body_x = self.body_gcn2(body_x, body_batch.edge_index)
-        body_x = self.body_relu(body_x)
-        body_x = self.body_gcn3(body_x, body_batch.edge_index)
-        body_x = self.body_relu(body_x)
-        body_x = self.body_dropout(body_x)
+        # 5-layer GCN with residual connections and layer normalization
+        body_residual = body_x_flat
+        body_x_flat = self.body_gcn1(body_x_flat, body_edge_expanded)
+        body_x_flat = body_x_flat.view(-1, self.num_body_joints, self.joint_feat_dim)
+        body_x_flat = self.body_layer_norms[0](body_x_flat).view(-1, self.joint_feat_dim)
+        body_x_flat = self.body_relu(body_x_flat) + body_residual  # Residual
 
-        body_x = body_x.view(B, T, self.num_body_joints * self.joint_feat_dim)  # [B, T, joints*feat]
+        body_residual = body_x_flat
+        body_x_flat = self.body_gcn2(body_x_flat, body_edge_expanded)
+        body_x_flat = body_x_flat.view(-1, self.num_body_joints, self.joint_feat_dim)
+        body_x_flat = self.body_layer_norms[1](body_x_flat).view(-1, self.joint_feat_dim)
+        body_x_flat = self.body_relu(body_x_flat) + body_residual
+
+        body_residual = body_x_flat
+        body_x_flat = self.body_gcn3(body_x_flat, body_edge_expanded)
+        body_x_flat = body_x_flat.view(-1, self.num_body_joints, self.joint_feat_dim)
+        body_x_flat = self.body_layer_norms[2](body_x_flat).view(-1, self.joint_feat_dim)
+        body_x_flat = self.body_relu(body_x_flat) + body_residual
+
+        body_residual = body_x_flat
+        body_x_flat = self.body_gcn4(body_x_flat, body_edge_expanded)
+        body_x_flat = body_x_flat.view(-1, self.num_body_joints, self.joint_feat_dim)
+        body_x_flat = self.body_layer_norms[3](body_x_flat).view(-1, self.joint_feat_dim)
+        body_x_flat = self.body_relu(body_x_flat) + body_residual
+
+        body_residual = body_x_flat
+        body_x_flat = self.body_gcn5(body_x_flat, body_edge_expanded)
+        body_x_flat = body_x_flat.view(-1, self.num_body_joints, self.joint_feat_dim)
+        body_x_flat = self.body_layer_norms[4](body_x_flat).view(-1, self.joint_feat_dim)
+        body_x_flat = self.body_relu(body_x_flat) + body_residual
+
+        body_x_flat = self.body_dropout(body_x_flat)
+
+        body_x = body_x_flat.view(B, T, self.num_body_joints * self.joint_feat_dim)  # [B, T, joints*feat]
         body_x = self.body_proj_out(body_x)  # [B, T, C]
         body_x = self.body_norm(body_x)
         body_x = body_x.permute(0, 2, 1)  # [B, C, T]
         body_x = self.body_decoder_post(body_x)
         body_out = self.body_logits(body_x)  # [B, body_feats, T]
 
-        # Hand decoding (similar structure)
+        # Hand decoding (similar optimized structure)
         hand_x = self.hand_decoder_pre(refined_feats)  # [B, C, T]
         hand_x = hand_x.permute(0, 2, 1)  # [B, T, C]
         hand_x = self.hand_proj_in(hand_x)  # [B, T, num_hand_joints * joint_feat_dim]
         hand_x = hand_x.view(B * T, self.num_hand_joints, self.joint_feat_dim)  # [B*T, joints, feat]
 
-        # Batch hand graphs
-        hand_data_list = [Data(x=hand_x[i], edge_index=self.hand_edge_index_template) for i in range(B * T)]
-        hand_batch = Batch.from_data_list(hand_data_list)
+        # Optimized batch hand graphs - vectorized edge index expansion
+        hand_x_flat = hand_x.view(-1, self.joint_feat_dim)  # [B*T*num_joints, feat]
+        hand_edge_expanded = self._expand_edge_index(
+            self.hand_edge_index_template, self.num_hand_joints, B * T
+        )
 
-        hand_x = self.hand_gcn1(hand_batch.x, hand_batch.edge_index)
-        hand_x = self.hand_relu(hand_x)
-        hand_x = self.hand_gcn2(hand_x, hand_batch.edge_index)
-        hand_x = self.hand_relu(hand_x)
-        hand_x = self.hand_gcn3(hand_x, hand_batch.edge_index)
-        hand_x = self.hand_relu(hand_x)
-        hand_x = self.hand_dropout(hand_x)
+        # 5-layer GCN with residual connections and layer normalization
+        hand_residual = hand_x_flat
+        hand_x_flat = self.hand_gcn1(hand_x_flat, hand_edge_expanded)
+        hand_x_flat = hand_x_flat.view(-1, self.num_hand_joints, self.joint_feat_dim)
+        hand_x_flat = self.hand_layer_norms[0](hand_x_flat).view(-1, self.joint_feat_dim)
+        hand_x_flat = self.hand_relu(hand_x_flat) + hand_residual  # Residual
 
-        hand_x = hand_x.view(B, T, self.num_hand_joints * self.joint_feat_dim)  # [B, T, joints*feat]
+        hand_residual = hand_x_flat
+        hand_x_flat = self.hand_gcn2(hand_x_flat, hand_edge_expanded)
+        hand_x_flat = hand_x_flat.view(-1, self.num_hand_joints, self.joint_feat_dim)
+        hand_x_flat = self.hand_layer_norms[1](hand_x_flat).view(-1, self.joint_feat_dim)
+        hand_x_flat = self.hand_relu(hand_x_flat) + hand_residual
+
+        hand_residual = hand_x_flat
+        hand_x_flat = self.hand_gcn3(hand_x_flat, hand_edge_expanded)
+        hand_x_flat = hand_x_flat.view(-1, self.num_hand_joints, self.joint_feat_dim)
+        hand_x_flat = self.hand_layer_norms[2](hand_x_flat).view(-1, self.joint_feat_dim)
+        hand_x_flat = self.hand_relu(hand_x_flat) + hand_residual
+
+        hand_residual = hand_x_flat
+        hand_x_flat = self.hand_gcn4(hand_x_flat, hand_edge_expanded)
+        hand_x_flat = hand_x_flat.view(-1, self.num_hand_joints, self.joint_feat_dim)
+        hand_x_flat = self.hand_layer_norms[3](hand_x_flat).view(-1, self.joint_feat_dim)
+        hand_x_flat = self.hand_relu(hand_x_flat) + hand_residual
+
+        hand_residual = hand_x_flat
+        hand_x_flat = self.hand_gcn5(hand_x_flat, hand_edge_expanded)
+        hand_x_flat = hand_x_flat.view(-1, self.num_hand_joints, self.joint_feat_dim)
+        hand_x_flat = self.hand_layer_norms[4](hand_x_flat).view(-1, self.joint_feat_dim)
+        hand_x_flat = self.hand_relu(hand_x_flat) + hand_residual
+
+        hand_x_flat = self.hand_dropout(hand_x_flat)
+
+        hand_x = hand_x_flat.view(B, T, self.num_hand_joints * self.joint_feat_dim)  # [B, T, joints*feat]
         hand_x = self.hand_proj_out(hand_x)  # [B, T, C]
         hand_x = self.hand_norm(hand_x)
         hand_x = hand_x.permute(0, 2, 1)  # [B, C, T]

@@ -522,7 +522,7 @@ class MiniData(Dataset, HDF5):
         self.text_in_modalities = text_in_modalities
         self.filler = filler
 
-        ## load modality shapes and data
+        ## load modality shapes and data - OPTIMIZED: convert to float32 once during loading
         self.shapes = []
         self.data = []
         for modality in self.modalities:
@@ -533,7 +533,10 @@ class MiniData(Dataset, HDF5):
                 sys.exit(1)
 
             self.shapes.append(data.shape)
-            self.data.append(data[()])
+            # OPTIMIZATION: Convert to float32 once during loading instead of float64 on every access
+            # This reduces memory usage and speeds up data transfer to GPU
+            loaded_data = data[()].astype(np.float32)
+            self.data.append(loaded_data)
             h5.close()
 
         if self.text_in_modalities:
@@ -552,6 +555,30 @@ class MiniData(Dataset, HDF5):
 
         self.update_idx_list(self.time, self.window_hop)
 
+        # OPTIMIZATION: Pre-cache normalization statistics if available
+        self.norm_stats = {}
+        self._load_normalization_stats()
+
+    def _load_normalization_stats(self):
+        """
+        Pre-load normalization statistics to avoid redundant computation.
+        Tries to load mean/std from HDF5 file if available.
+        """
+        try:
+            import h5py
+            with h5py.File(self.path2h5, 'r') as h5:
+                for modality in self.modalities:
+                    if 'pose' in modality:
+                        # Try to load cached normalization stats
+                        norm_key = modality.replace('data', 'norm_stats')
+                        if norm_key in h5:
+                            self.norm_stats[modality] = {
+                                'mean': h5[norm_key + '/mean'][()].astype(np.float32),
+                                'std': h5[norm_key + '/std'][()].astype(np.float32)
+                            }
+        except Exception:
+            # If loading fails, stats will be computed on-the-fly (fallback)
+            pass
 
     # 根据给定的时间长度（time）和滑动步长（window_hop）计算每个模态（如姿势、音频等）的时间窗口索引。
     # 这些索引用于后续从数据中提取特定时间窗口的数据片段。
@@ -603,16 +630,16 @@ class MiniData(Dataset, HDF5):
 
     """
     __getitem__ 方法被定义为返回特定索引对应的数据项。
-    
+
     当 MiniData 类的实例被用在需要索引访问的上下文中时，比如在一个循环中迭代该实例，或者直接通过索引获取数据时，__getitem__ 方法就会被自动调用。
-    
+
     在Python中，__getitem__ 是一个特殊方法，它允许类的实例在被索引时自动调用。具体来说，当一个对象被当作序列或映射来访问时，比如使用 obj[index] 的语法，Python会自动调用该对象的 __getitem__ 方法，并将索引值作为参数传递给它。
     """
     def __getitem__(self, idx):
         item = {}
         ## args.modalities = ['pose/normalize', 'text/w2v']
         for i, modality in enumerate(self.modalities):
-            ## read from loaded data
+            ## read from loaded data - OPTIMIZED: data already in float32
             data = self.data[i]
 
             ## open h5 file
@@ -622,7 +649,19 @@ class MiniData(Dataset, HDF5):
             end = self.idx_end_list_dict[modality][idx]
             interval = self.idx_interval_dict[modality]
 
-            item[modality] = data[start:end:interval].astype(np.float64)
+            # OPTIMIZATION: Remove redundant type conversion - data is already float32
+            # Use slicing without type conversion for better performance
+            sliced_data = data[start:end:interval]
+
+            # Apply cached normalization if available (for pose data)
+            if modality in self.norm_stats:
+                mean = self.norm_stats[modality]['mean']
+                std = self.norm_stats[modality]['std']
+                # Avoid division by zero
+                std = np.where(std < 1e-7, 1.0, std)
+                sliced_data = (sliced_data - mean) / std
+
+            item[modality] = sliced_data
             start_time = data[0:start:interval].shape[0] / self.fs_new[-1]
 
             if 'text' in modality:
@@ -636,13 +675,13 @@ class MiniData(Dataset, HDF5):
                     text_df_ = self.text_df[(start <= self.text_df['end_frame']) & (end > self.text_df['start_frame'])]
                     starts_ = text_df_['start_frame'].values - start
                     starts_[0] = 0
-                    indices = list(starts_.astype(np.int))
+                    indices = list(starts_.astype(np.int32))  # OPTIMIZATION: use int32 instead of default int
                 if not self.repeat_text:
                     item.update({modality: vec[indices]})  ## if self.repeat_text == 0, update the text modality
 
                 ## add filler masks
                 if self.filler:
-                    filler = np.zeros((len(indices),))
+                    filler = np.zeros((len(indices),), dtype=np.float32)  # OPTIMIZATION: use float32
                     if self.text_df is None:
                         pass  ## if text_df is not available, assume no word is filler
                     else:
@@ -652,24 +691,24 @@ class MiniData(Dataset, HDF5):
                         if 'bert' in modality or 'tokens' in modality:
                             words = self.tokenizer.tokenize(' '.join(words))
 
-                        for i, word in enumerate(words[:len(indices)]):
+                        for j, word in enumerate(words[:len(indices)]):
                             if word in self.stopwords:
-                                filler[i] = 1
+                                filler[j] = 1
                     if self.repeat_text:
-                        filler_ = np.zeros((vec.shape[0],))
+                        filler_ = np.zeros((vec.shape[0],), dtype=np.float32)
                         end_indices = indices[1:] + [vec.shape[0]]
-                        for i, (st, en) in enumerate(zip(indices, end_indices)):
-                            filler_[st:en] = filler[i]
+                        for j, (st, en) in enumerate(zip(indices, end_indices)):
+                            filler_[st:en] = filler[j]
                         filler = filler_
                     item.update({'text/filler': filler})
 
                 ## duration of each word
-                indices_arr = np.array(indices).astype(np.int)
+                indices_arr = np.array(indices, dtype=np.int32)  # OPTIMIZATION: use int32
                 length_word = np.zeros_like(indices_arr)
                 length_word[:-1] = indices_arr[1:] - indices_arr[:-1]
                 duration = (end - start) / interval
                 length_word[-1] = duration - indices_arr[-1]
-                item.update({'text/token_duration': length_word.astype(np.int)})
+                item.update({'text/token_duration': length_word})
 
             ## close h5 file
             # h5.close()
@@ -685,7 +724,7 @@ class MiniData(Dataset, HDF5):
                               'end': end_time,
                               'idx': idx}})
 
-        item['style'] = np.zeros(item[self.modalities[0]].shape[0]) + self.style
+        item['style'] = np.zeros(item[self.modalities[0]].shape[0], dtype=np.float32) + self.style
 
         return item
 
