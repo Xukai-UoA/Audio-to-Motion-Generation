@@ -121,8 +121,12 @@ class SelfAttention_G(nn.Module):
 
         # Bone loss setup (as original, assuming joint_subset is defined elsewhere or here)
         self.parents = self.skeleton.parents
+        self.joint_names = self.skeleton.joint_names
         # Example joint_subset; adjust as needed
         self.joint_subset = list(range(out_feats // 2))  # Assuming 2D poses, half for x/y
+
+        # Initialize body triples for body angle constraints
+        self.body_triples = self._initialize_body_triples()
 
     def _expand_edge_index(self, edge_index, num_nodes, batch_size):
         """
@@ -267,7 +271,8 @@ class SelfAttention_G(nn.Module):
             bone_loss = self.compute_bone_length_loss(real_pose, out)
             internal_losses.append(bone_loss)
 
-        angle_loss = self.compute_hand_joint_angle_loss(out)
+        # 使用综合角度损失（包括手部和身体关节）
+        angle_loss = self.compute_comprehensive_angle_loss(out)
         internal_losses.append(angle_loss)
 
         return out, internal_losses
@@ -284,6 +289,19 @@ class SelfAttention_G(nn.Module):
                         hand_triples.append((parent_idx, i, j))
                         break
         return hand_triples
+
+    def _initialize_body_triples(self):
+        """Initialize body_triples for body angle loss computation."""
+        body_triples = []
+        for i in range(self.num_body_joints):
+            parent_idx = self.skeleton.parents[i] if self.skeleton.parents[i] < self.num_body_joints else -1
+            if parent_idx != -1:
+                # Find children
+                for j in range(i + 1, self.num_body_joints):
+                    if self.skeleton.parents[j] == i:
+                        body_triples.append((parent_idx, i, j))
+                        break
+        return body_triples
 
 
     def compute_bone_length_loss(self, real_pose, gen_pose):
@@ -373,6 +391,75 @@ class SelfAttention_G(nn.Module):
 
         return angle_loss
 
+    def compute_body_joint_angle_loss(self, gen_pose):
+        """
+        计算身体关节角度约束损失，确保符合人体物理约束。
+        - gen_pose: [B, T, 104] 生成姿势
+        返回: 标量损失
+        """
+        B, T, _ = gen_pose.shape
+        num_joints = len(self.parents)  # 52关节
+
+        if gen_pose.shape[-1] != num_joints * 2:
+            return torch.tensor(0.0, device=gen_pose.device)
+
+        # 重塑为 [B, T, num_joints, 2] (x,y坐标)
+        gen_pose = gen_pose.view(B, T, num_joints, 2)
+
+        # 只取身体关节 (0:10)
+        gen_body_pose = gen_pose[:, :, :10, :]  # [B, T, 10, 2]
+
+        # 如果没有body_triples，返回0损失
+        if not self.body_triples:
+            return torch.tensor(0.0, device=gen_pose.device)
+
+        def get_body_angles(body_pose):
+            angles = []
+            for p, j, c in self.body_triples:
+                # vec_pj: from p to j (parent to joint)
+                vec_pj = body_pose[:, :, j, :] - body_pose[:, :, p, :]  # [B, T, 2]
+                # vec_jc: from j to c (joint to child)
+                vec_jc = body_pose[:, :, c, :] - body_pose[:, :, j, :]  # [B, T, 2]
+                dot_product = torch.sum(vec_pj * vec_jc, dim=-1)  # [B, T]
+                cross = vec_pj[:, :, 0] * vec_jc[:, :, 1] - vec_pj[:, :, 1] * vec_jc[:, :, 0]  # [B, T]
+                angle = torch.atan2(cross, dot_product)  # [B, T]
+                angles.append(angle)
+            if angles:
+                angles = torch.stack(angles, dim=-1)  # [B, T, num_triples]
+            else:
+                return None
+            return angles
+
+        gen_angles = get_body_angles(gen_body_pose)
+
+        if gen_angles is None:
+            return torch.tensor(0.0, device=gen_pose.device)
+
+        # 身体关节角度约束：合理范围为 -pi/2 到 pi（允许更大范围的运动）
+        min_angle = -torch.pi / 2
+        max_angle = torch.pi
+
+        # 计算范围约束损失
+        lower_penalty = torch.relu(min_angle - gen_angles)
+        upper_penalty = torch.relu(gen_angles - max_angle)
+        angle_loss = torch.mean(lower_penalty + upper_penalty)
+
+        return angle_loss
+
+    def compute_comprehensive_angle_loss(self, gen_pose):
+        """
+        综合角度损失：结合手部和身体关节角度约束。
+        - gen_pose: [B, T, 104] 生成姿势
+        返回: 标量损失
+        """
+        hand_angle_loss = self.compute_hand_joint_angle_loss(gen_pose)
+        body_angle_loss = self.compute_body_joint_angle_loss(gen_pose)
+
+        # 手部角度更重要，因为手指关节约束更严格
+        total_angle_loss = 0.7 * hand_angle_loss + 0.3 * body_angle_loss
+
+        return total_angle_loss
+
 
 class SelfAttention_D(nn.Module):
     def __init__(self, in_channels=104, out_channels=64, n_downsampling=2, p=0.3, groups=1, aux_classes=10, **kwargs):
@@ -413,21 +500,19 @@ class SelfAttention_D(nn.Module):
         self.register_buffer('body_edge_index_template', self.body_edge_index)
         self.register_buffer('hand_edge_index_template', self.hand_edge_index)
 
-        # Enhanced conv1: Added ResBlock for depth
+        # Enhanced conv1: Simplified - removed unnecessary attention and ResBlock
         self.conv1 = nn.Sequential(
             nn.Conv1d(in_channels * groups, out_channels * groups, kernel_size=4, stride=2, padding=1, groups=groups),
             nn.BatchNorm1d(out_channels * groups),
             nn.LeakyReLU(negative_slope=0.2),
             nn.Dropout(p=p),
-            ResBlock(out_channels * groups, type='1d', p=p),
-            SelfAttention(out_channels * groups),
             nn.Conv1d(out_channels * groups, out_channels * groups, kernel_size=4, stride=1, padding=1, groups=groups),
             nn.BatchNorm1d(out_channels * groups),
             nn.LeakyReLU(negative_slope=0.2),
             nn.Dropout(p=p)
         )
 
-        # Enhanced conv2: Deeper with ResBlock and reduced downsampling
+        # Enhanced conv2: Simplified with fewer layers and no attention (reduce discriminator strength)
         self.conv2 = nn.ModuleList()
         current_channels = out_channels * groups
         for n in range(1, n_downsampling + 1):
@@ -438,8 +523,6 @@ class SelfAttention_D(nn.Module):
                 nn.BatchNorm1d(current_channels * ch_mul),
                 nn.LeakyReLU(negative_slope=0.2),
                 nn.Dropout(p=p),
-                ResBlock(current_channels * ch_mul, type='1d', p=p),
-                SelfAttention(current_channels * ch_mul),
                 nn.Conv1d(current_channels * ch_mul, current_channels * ch_mul, kernel_size=4, stride=1, padding=1,
                           groups=groups),
                 nn.BatchNorm1d(current_channels * ch_mul),
@@ -448,22 +531,18 @@ class SelfAttention_D(nn.Module):
             ))
             current_channels = current_channels * ch_mul
 
-        # Enhanced conv3: Adjusted kernel size to 3 and added dynamic padding check
+        # Enhanced conv3: Simplified - only one attention at the end
         self.conv3 = nn.Sequential(
             nn.Conv1d(current_channels, current_channels * 2, kernel_size=4, stride=1, padding=1, groups=groups),
-            # Reduced kernel to 3
             nn.BatchNorm1d(current_channels * 2),
             nn.LeakyReLU(negative_slope=0.2),
             nn.Dropout(p=p),
-            ResBlock(current_channels * 2, type='1d', p=p),
-            SelfAttention(current_channels * 2),
 
             nn.Conv1d(current_channels * 2, current_channels * 4, kernel_size=4, stride=1, padding=1, groups=groups),
-            # Reduced kernel to 3
             nn.BatchNorm1d(current_channels * 4),
             nn.LeakyReLU(negative_slope=0.2),
             nn.Dropout(p=p),
-            SelfAttention(current_channels * 4),
+            SelfAttention(current_channels * 4),  # 只在最后保留一个attention
 
             nn.Conv1d(current_channels * 4, current_channels * 4, kernel_size=3, stride=1, padding=1, groups=groups),
             nn.BatchNorm1d(current_channels * 4),

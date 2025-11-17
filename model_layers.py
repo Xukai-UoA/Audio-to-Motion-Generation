@@ -307,7 +307,7 @@ class UNet1D(nn.Module):
         self.bottleneck = nn.ModuleList()
         self.max_depth = max_depth
 
-        # 下采样路径
+        # 下采样路径 - 移除了不必要的attention层以提高训练速度
         self.downsample_layers.append(ConvNormRelu(in_channels=input_channels, out_channels=input_channels*2, type='1d', leaky=True, downsample=False,
                                       kernel_size=kernel_size, stride=stride, p=p, groups=groups))
         self.downsample_layers.append(ConvNormRelu(in_channels=input_channels*2, out_channels=input_channels*2, type='1d', leaky=True, downsample=True,
@@ -321,79 +321,55 @@ class UNet1D(nn.Module):
         self.bottleneck = ConvNormRelu(in_channels=input_channels*4, out_channels=input_channels*8,
             type='1d', leaky=True, downsample=False, p=p, groups=groups)
 
-        # 上采样路径
-        # self.upsample_layers.append(nn.Upsample(scale_factor=2, mode='nearest'))
-        self.upsample_layers.append(ConvNormRelu(in_channels=input_channels*8, out_channels=input_channels*8, type='1d', leaky=True, downsample=False,
-                                        kernel_size=kernel_size, stride=stride, p=p, groups=groups))
+        # 上采样路径 - 优化跳跃连接结构
         self.upsample_layers.append(ConvTranspose1D(in_channels=input_channels*8, out_channels=input_channels*4, stride=2, output_padding=1))
         self.upsample_layers.append(ConvNormRelu(in_channels=input_channels * 8, out_channels=input_channels * 4, type='1d', leaky=True, downsample=False,
-                                        kernel_size=kernel_size, stride=stride, p=p, groups=groups))
+                                        kernel_size=kernel_size, stride=stride, p=p, groups=groups))  # 处理cat后的8倍通道
         self.upsample_layers.append(ConvTranspose1D(in_channels=input_channels * 4, out_channels=input_channels * 2, stride=2, output_padding=1))
         self.upsample_layers.append(ConvNormRelu(in_channels=input_channels * 4, out_channels=input_channels * 2, type='1d', leaky=True, downsample=False,
-                                        kernel_size=kernel_size, stride=stride, p=p, groups=groups))
+                                        kernel_size=kernel_size, stride=stride, p=p, groups=groups))  # 处理cat后的4倍通道
 
         # 最终输出层
         self.final_conv = nn.Conv1d(input_channels*2, output_channels, kernel_size=1)
 
-        # self-Attentions mech
-        self.down_attentions = nn.ModuleList([
-            SelfAttention(input_channels * 2),  # 第一下采样块后
-            SelfAttention(input_channels * 4),  # 第二下采样块后
-        ])
-
+        # 只在瓶颈层保留attention - 减少计算量同时保持关键特征建模能力
         self.bottleneck_attention = SelfAttention(input_channels * 8)
 
-        # self-Attentions at skip connection
-        self.up_attentions = nn.ModuleList([
-            SelfAttention(input_channels * 8),  # 第一跳跃连接后（cat后通道为input_channels*4 + input_channels*4 = input_channels*8）
-            SelfAttention(input_channels * 4)  # 第二跳跃连接后（cat后通道为input_channels*2 + input_channels*2 = input_channels*4）
-        ])
+        # 只在最关键的上采样位置保留一个attention
+        self.up_attention = SelfAttention(input_channels * 4)  # 第一跳跃连接后
 
     def forward(self, x):
         # input_shape: (batch_size=256, input_channels=256, time_step=64)
         skip_connections = []
-        down_attn_idx = 0
-        up_attn_idx = 0
 
-        # 下采样
-        for i in range(0, len(self.downsample_layers), 2):
-            x = self.downsample_layers[i](x)
-            skip_connections.append(x)  # 保存跳跃连接
+        # 下采样 - 无attention，提高训练速度
+        # 第一下采样块
+        x = self.downsample_layers[0](x)  # [B, C*2, T]
+        skip_connections.append(x)  # 保存跳跃连接
+        x = self.downsample_layers[1](x)  # [B, C*2, T/2] 下采样
 
-            x = self.downsample_layers[i + 1](x)
-            x = self.down_attentions[down_attn_idx](x)  # 应用自注意力
-            down_attn_idx += 1
+        # 第二下采样块
+        x = self.downsample_layers[2](x)  # [B, C*4, T/2]
+        skip_connections.append(x)  # 保存跳跃连接
+        x = self.downsample_layers[3](x)  # [B, C*4, T/4] 下采样
 
-        # 瓶颈层
-        x = self.bottleneck(x)  # torch.Size([129, 2048, 8]) => torch.Size([129, 4096, 8])
+        # 瓶颈层 - 只在这里使用attention
+        x = self.bottleneck(x)  # [B, C*8, T/4]
         x = self.bottleneck_attention(x)
-        """
-        # 上采样
-        for i in range(0, len(self.upsample_layers), 2):
-            x = self.upsample_layers[i](x)  # 上采样或卷积
 
-            if i < len(self.upsample_layers) - 1:  # 非最后一层
-                x = self.upsample_layers[i + 1](x)  # 下一层操作
+        # 上采样 - 修复跳跃连接
+        # 第一上采样块
+        x = self.upsample_layers[0](x)  # ConvTranspose: [B, C*4, T/2]
+        skip = skip_connections.pop()  # [B, C*4, T/2]
+        x = torch.cat([x, skip], dim=1)  # [B, C*8, T/2]
+        x = self.up_attention(x)  # 在最重要的位置应用attention
+        x = self.upsample_layers[1](x)  # [B, C*4, T/2]
 
-            if i % 2 == 0 and i > 0:  # 在上采样块后应用注意力
-                skip_connection = skip_connections.pop()
-                x = torch.cat([x, skip_connection], dim=1)
-                x = self.up_attentions[up_attn_idx](x)  # 应用自注意力
-                up_attn_idx += 1
-        """
-
-        # 上采样
-        for i in range(0, len(self.upsample_layers), 2):
-            if i % 2 == 0 and i > 0:  # cat and attention before post-cat conv
-                skip_connection = skip_connections.pop()
-                x = torch.cat([x, skip_connection], dim=1)
-                x = self.up_attentions[up_attn_idx](x)  # Apply attention on cat result
-                up_attn_idx += 1
-
-            x = self.upsample_layers[i](x)  # post-cat conv for i>0
-
-            if i < len(self.upsample_layers) - 1:
-                x = self.upsample_layers[i + 1](x)  # Next transpose (if applicable)
+        # 第二上采样块
+        x = self.upsample_layers[2](x)  # ConvTranspose: [B, C*2, T]
+        skip = skip_connections.pop()  # [B, C*2, T]
+        x = torch.cat([x, skip], dim=1)  # [B, C*4, T]
+        x = self.upsample_layers[3](x)  # [B, C*2, T]
 
         return self.final_conv(x)
 
