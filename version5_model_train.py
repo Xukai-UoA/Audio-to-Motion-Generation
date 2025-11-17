@@ -213,6 +213,41 @@ def pos_to_motion(pose_batch):
     return diff
 
 
+def compute_temporal_smoothness_loss(motion_seq):
+    """
+    计算运动序列的平滑度损失，确保生成的动作连贯。
+    motion_seq: [B, T-1, features] - 帧间差分（速度）
+    返回: 标量损失
+    """
+    # 速度已经是motion_seq（一阶导数）
+    # 计算加速度（二阶导数）
+    acceleration = motion_seq[:, 1:] - motion_seq[:, :-1]  # [B, T-2, features]
+
+    # 加速度的L2范数作为平滑度度量
+    # 惩罚急剧的加速度变化，使动作更自然
+    smoothness_loss = torch.mean(torch.norm(acceleration, dim=-1))
+
+    return smoothness_loss
+
+
+def compute_jerk_loss(motion_seq):
+    """
+    计算jerk损失（三阶导数），进一步提高运动平滑度。
+    motion_seq: [B, T-1, features] - 帧间差分（速度）
+    返回: 标量损失
+    """
+    # 加速度（二阶导数）
+    acceleration = motion_seq[:, 1:] - motion_seq[:, :-1]  # [B, T-2, features]
+
+    # Jerk（三阶导数）
+    jerk = acceleration[:, 1:] - acceleration[:, :-1]  # [B, T-3, features]
+
+    # Jerk的L2范数
+    jerk_loss = torch.mean(torch.norm(jerk, dim=-1))
+
+    return jerk_loss
+
+
 if __name__ == '__main__':
     # Load speaker data
     dataloader = Data_Loader(**common_kwargs)
@@ -331,7 +366,12 @@ if __name__ == '__main__':
                 # Loss measures generator's ability to fool the discriminator
                 G_loss = motion_reg_loss(real_motion, fake_motion) + lambda_gan * g_loss(fake_d, valid)
 
-                # Add internal losses
+                # Add temporal smoothness loss for motion continuity
+                smoothness_loss = compute_temporal_smoothness_loss(fake_motion)
+                jerk_loss = compute_jerk_loss(fake_motion)
+                G_loss += 0.1 * smoothness_loss + 0.05 * jerk_loss
+
+                # Add internal losses (bone length and angle constraints)
                 for loss in internal_losses:
                     G_loss += loss
 
@@ -391,6 +431,8 @@ if __name__ == '__main__':
         val_d_loss = 0.0
         val_bone_loss = 0.0
         val_angle_loss = 0.0
+        val_smoothness_loss = 0.0
+        val_jerk_loss = 0.0
         val_steps = 0
 
         with torch.no_grad():  # 禁用梯度计算
@@ -409,6 +451,12 @@ if __name__ == '__main__':
 
                 real_motion_val = pos_to_motion(real_pose_val)
                 fake_motion_val = pos_to_motion(fake_pose_val)
+
+                # 计算时序平滑损失
+                smoothness = compute_temporal_smoothness_loss(fake_motion_val)
+                jerk = compute_jerk_loss(fake_motion_val)
+                val_smoothness_loss += smoothness.item()
+                val_jerk_loss += jerk.item()
 
                 # create dynamic batch size
                 val_batch_size = real_pose_val.size(0)  # get current batch size
@@ -437,11 +485,14 @@ if __name__ == '__main__':
         val_g_loss_list.append(val_g_loss)
         val_d_loss_list.append(val_d_loss)
 
-        # 计算平均bone_loss, angle_loss
+        # 计算平均bone_loss, angle_loss, smoothness_loss
         avg_bone_loss = val_bone_loss / val_steps
         avg_angle_loss = val_angle_loss / val_steps
-        
-        print(f"[Validation] Epoch {epoch}/{n_epochs} | G_loss: {val_g_loss:.4f} | D_loss: {val_d_loss:.4f} | Avg Bone Loss: {avg_bone_loss:.4f} | Avg Angle Loss: {avg_angle_loss:.4f}")
+        avg_smoothness_loss = val_smoothness_loss / val_steps
+        avg_jerk_loss = val_jerk_loss / val_steps
+
+        print(f"[Validation] Epoch {epoch}/{n_epochs} | G_loss: {val_g_loss:.4f} | D_loss: {val_d_loss:.4f}")
+        print(f"  Bone Loss: {avg_bone_loss:.4f} | Angle Loss: {avg_angle_loss:.4f} | Smoothness Loss: {avg_smoothness_loss:.4f} | Jerk Loss: {avg_jerk_loss:.4f}")
 
         # switch back to training mode
         generator.train()
