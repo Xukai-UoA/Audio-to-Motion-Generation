@@ -626,6 +626,29 @@ class SelfAttention_D(nn.Module):
         )
         self.aux_loss_fn = nn.CrossEntropyLoss()
 
+    def _expand_edge_index(self, edge_index, num_nodes, batch_size):
+        """
+        Vectorized edge index expansion for efficient batch GCN processing.
+        Avoids creating individual Data objects and using Batch.from_data_list().
+
+        Args:
+            edge_index: [2, num_edges] template edge index
+            num_nodes: number of nodes per graph
+            batch_size: number of graphs in batch
+
+        Returns:
+            Expanded edge index [2, batch_size * num_edges]
+        """
+        # Create offsets for each graph in batch
+        offsets = torch.arange(batch_size, device=edge_index.device) * num_nodes
+        offsets = offsets.view(-1, 1, 1)  # [batch_size, 1, 1]
+
+        # Expand edge_index for all graphs
+        edge_index_expanded = edge_index.unsqueeze(0) + offsets  # [batch_size, 2, num_edges]
+        edge_index_expanded = edge_index_expanded.permute(1, 0, 2).reshape(2, -1)  # [2, batch_size * num_edges]
+
+        return edge_index_expanded
+
     def forward(self, x, audio=None, aux_labels=None):
         # Input shape check and padding
         x = x.transpose(-1, -2)  # (N, pose_feats, time)
@@ -644,25 +667,33 @@ class SelfAttention_D(nn.Module):
         x_body = x[:, :C // 2, :]  # Split channels for body
         x_hand = x[:, C // 2:, :]  # For hand
 
-        # Project and process body graph
-        x_body = x_body.mean(dim=2)  # Global avg pool for simplicity
-        x_body = self.body_proj(x_body)
-        x_body = x_body.view(B, self.num_body_joints, self.joint_feat_dim)
-        body_data_list = [Data(x=x_body[i], edge_index=self.body_edge_index_template) for i in range(B)]
-        body_batch = Batch.from_data_list(body_data_list)
-        x_body = self.body_gat(body_batch.x, body_batch.edge_index)
-        x_body = x_body.view(B, -1)
-        x_body = self.body_graph_out(x_body)
+        # Project and process body graph - OPTIMIZED with vectorized batch processing
+        x_body = x_body.mean(dim=2)  # Global avg pool for simplicity [B, C//2]
+        x_body = self.body_proj(x_body)  # [B, num_body_joints * joint_feat_dim]
+        x_body = x_body.view(B, self.num_body_joints, self.joint_feat_dim)  # [B, joints, feat]
 
-        # Hand graph
-        x_hand = x_hand.mean(dim=2)
-        x_hand = self.hand_proj(x_hand)
-        x_hand = x_hand.view(B, self.num_hand_joints, self.joint_feat_dim)
-        hand_data_list = [Data(x=x_hand[i], edge_index=self.hand_edge_index_template) for i in range(B)]
-        hand_batch = Batch.from_data_list(hand_data_list)
-        x_hand = self.hand_gat(hand_batch.x, hand_batch.edge_index)
-        x_hand = x_hand.view(B, -1)
-        x_hand = self.hand_graph_out(x_hand)
+        # Vectorized batch processing for body graph
+        x_body_flat = x_body.view(-1, self.joint_feat_dim)  # [B*num_body_joints, feat]
+        body_edge_expanded = self._expand_edge_index(
+            self.body_edge_index_template, self.num_body_joints, B
+        )
+        x_body_flat = self.body_gat(x_body_flat, body_edge_expanded)  # [B*num_body_joints, feat]
+        x_body = x_body_flat.view(B, -1)  # [B, num_body_joints * feat]
+        x_body = self.body_graph_out(x_body)  # [B, output_dim]
+
+        # Hand graph - OPTIMIZED with vectorized batch processing
+        x_hand = x_hand.mean(dim=2)  # [B, C//2]
+        x_hand = self.hand_proj(x_hand)  # [B, num_hand_joints * joint_feat_dim]
+        x_hand = x_hand.view(B, self.num_hand_joints, self.joint_feat_dim)  # [B, joints, feat]
+
+        # Vectorized batch processing for hand graph
+        x_hand_flat = x_hand.view(-1, self.joint_feat_dim)  # [B*num_hand_joints, feat]
+        hand_edge_expanded = self._expand_edge_index(
+            self.hand_edge_index_template, self.num_hand_joints, B
+        )
+        x_hand_flat = self.hand_gat(x_hand_flat, hand_edge_expanded)  # [B*num_hand_joints, feat]
+        x_hand = x_hand_flat.view(B, -1)  # [B, num_hand_joints * feat]
+        x_hand = self.hand_graph_out(x_hand)  # [B, output_dim]
 
         # Fuse body/hand graph outputs back
         x_graph = torch.cat([x_body, x_hand], dim=1)

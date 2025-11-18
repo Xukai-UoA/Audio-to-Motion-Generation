@@ -1,3 +1,4 @@
+import os
 import time
 import numpy as np
 import torch
@@ -181,12 +182,12 @@ class CurriculumGANTraining:
             base_noise_std = max_noise_std - progress * (max_noise_std - min_noise_std)
 
         # Smooth value annealing： stronger smoothness in the early stage
-        base_real_smooth = self.real_label_smooth - max_smooth_offset * (1 - progress) if is_real else self.fake_label_smooth + max_smooth_offset * (1 - progress)
+        base_smooth_val = self.real_label_smooth - max_smooth_offset * (1 - progress) if is_real else self.fake_label_smooth + max_smooth_offset * (1 - progress)
 
         # generate labels
         recent_d, recent_g = self.get_recent_avg_loss() if len(self.d_loss_history) >= 10 else (0.5, 0.5)
         if is_real:
-            smooth_val = base_real_smooth
+            smooth_val = base_smooth_val
             if self.dynamic_smooth and recent_d < self.d_strong_threshold:
                 smooth_val = max(0.97, smooth_val - 0.1)  # 判别器过强，增加平滑
                 noise_std = base_noise_std + 0.01  # 额外噪声
@@ -195,9 +196,10 @@ class CurriculumGANTraining:
             labels = torch.ones(batch_size, 4, device=device).fill_(smooth_val)
             labels = torch.clamp(labels + torch.normal(0, noise_std, labels.shape, device=device), 0.85, 1.0)
         else:
-            smooth_val = base_real_smooth
+            smooth_val = base_smooth_val
             if self.dynamic_smooth and recent_g < self.g_strong_threshold:
-                smooth_val = min(0.03, smooth_val + 0.1)  # 生成器过强，增加假标签平滑
+                # 生成器过强时，减少假标签平滑度，让判别器更容易区分（帮助判别器）
+                smooth_val = max(0.0, smooth_val - 0.05)  # 降低smooth_val使假标签更接近0
                 noise_std = base_noise_std + 0.01
             else:
                 noise_std = base_noise_std
