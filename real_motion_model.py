@@ -119,6 +119,24 @@ class SelfAttention_G(nn.Module):
         )
         self.hand_logits = nn.Conv1d(out_channels, self.hand_feats, kernel_size=1, stride=1)
 
+        # 身体-手部联合注意力机制 (Body-Hand Joint Attention)
+        self.body_hand_cross_attention = nn.MultiheadAttention(
+            embed_dim=out_channels,
+            num_heads=8,
+            batch_first=True,
+            dropout=p
+        )
+        # 手部-身体反向注意力（可选，增强双向交互）
+        self.hand_body_cross_attention = nn.MultiheadAttention(
+            embed_dim=out_channels,
+            num_heads=8,
+            batch_first=True,
+            dropout=p
+        )
+        # Layer normalization for attention outputs
+        self.body_attn_norm = nn.LayerNorm(out_channels)
+        self.hand_attn_norm = nn.LayerNorm(out_channels)
+
         # Bone loss setup (as original, assuming joint_subset is defined elsewhere or here)
         self.parents = self.skeleton.parents
         self.joint_names = self.skeleton.joint_names
@@ -206,6 +224,10 @@ class SelfAttention_G(nn.Module):
         body_x = self.body_proj_out(body_x)  # [B, T, C]
         body_x = self.body_norm(body_x)
         body_x = body_x.permute(0, 2, 1)  # [B, C, T]
+
+        # 在decoder_post之前保存body特征用于交叉注意力
+        body_x_for_attention = body_x  # [B, C, T]
+
         body_x = self.body_decoder_post(body_x)
         body_out = self.body_logits(body_x)  # [B, body_feats, T]
 
@@ -258,6 +280,33 @@ class SelfAttention_G(nn.Module):
         hand_x = self.hand_proj_out(hand_x)  # [B, T, C]
         hand_x = self.hand_norm(hand_x)
         hand_x = hand_x.permute(0, 2, 1)  # [B, C, T]
+
+        # ============ 身体-手部联合注意力建模 (Body-Hand Joint Attention) ============
+        # 将身体和手部特征转换为 [B, T, C] 格式用于多头注意力
+        body_feat_t = body_x_for_attention.permute(0, 2, 1)  # [B, T, C]
+        hand_feat_t = hand_x.permute(0, 2, 1)  # [B, T, C]
+
+        # 交叉注意力：手部query，身体key/value (手部动作参考身体姿态)
+        hand_attended, _ = self.body_hand_cross_attention(
+            hand_feat_t, body_feat_t, body_feat_t
+        )
+        hand_feat_t = self.hand_attn_norm(hand_attended + hand_feat_t)  # 残差连接 + LayerNorm
+
+        # 反向交叉注意力：身体query，手部key/value (身体姿态参考手部动作)
+        body_attended, _ = self.hand_body_cross_attention(
+            body_feat_t, hand_feat_t, hand_feat_t
+        )
+        body_feat_t = self.body_attn_norm(body_attended + body_feat_t)  # 残差连接 + LayerNorm
+
+        # 转换回 [B, C, T] 格式
+        hand_x = hand_feat_t.permute(0, 2, 1)  # [B, C, T]
+        body_x_enhanced = body_feat_t.permute(0, 2, 1)  # [B, C, T]
+
+        # 使用增强后的特征进行最终解码
+        # 重新计算body_out with enhanced features
+        body_x_enhanced = self.body_decoder_post(body_x_enhanced)
+        body_out = self.body_logits(body_x_enhanced)  # [B, body_feats, T]
+
         hand_x = self.hand_decoder_post(hand_x)
         hand_out = self.hand_logits(hand_x)  # [B, hand_feats, T]
 
