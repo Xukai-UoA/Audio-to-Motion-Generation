@@ -3,14 +3,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler  # 混合精度训练
 
 from pats.data_loading import Data_Loader
 from real_motion_model import *
 from normalization_tools import get_mean_std, get_mean_std_necksub
 
 
-class DynamicGANTraining:
-    """动态GAN训练策略类"""
+class CurriculumGANTraining:
+    """渐进式/课程学习GAN训练策略类 - 继承并扩展动态训练"""
 
     def __init__(self, g_lr=5e-6, d_lr=10e-6):
         self.g_lr_initial = g_lr
@@ -18,22 +19,38 @@ class DynamicGANTraining:
         self.g_lr_current = g_lr
         self.d_lr_current = d_lr
 
+        # 课程学习参数
+        self.curriculum_epochs = 50  # 前50个epoch使用渐进式策略
+        self.warmup_epochs = 10  # 前10个epoch为预热阶段
+
+        # 渐进式损失权重
+        self.initial_detail_weight = 0.3  # 初始细节损失权重（低）
+        self.final_detail_weight = 1.0    # 最终细节损失权重（高）
+
+        # 渐进式物理约束权重
+        self.initial_physics_weight = 0.5
+        self.final_physics_weight = 2.0
+
         # record every batch loss
         self.d_loss_history = []
         self.g_loss_history = []
 
-        # 动态调整参数
-        self.d_strong_threshold = 0.20  # 判别器过强阈值
-        self.g_weak_threshold = 0.80  # 生成器过弱阈值
-        self.g_strong_threshold = 0.10
+        # 动态调整参数 - 更激进的平衡策略
+        self.d_strong_threshold = 0.25  # 判别器过强阈值（提高以减少误判）
+        self.g_weak_threshold = 0.75  # 生成器过弱阈值
+        self.g_strong_threshold = 0.12
 
-        # 训练频率控制
+        # 训练频率控制 - 更大的调整范围
         self.d_train_freq = 1
-        self.g_train_freq = 3
+        self.g_train_freq = 4  # 初始增加生成器训练频率
         self.min_d_freq = 1
-        self.max_d_freq = 2
-        self.min_g_freq = 2
-        self.max_g_freq = 6
+        self.max_d_freq = 3  # 允许更高的判别器训练频率
+        self.min_g_freq = 3  # 提高最小生成器训练频率
+        self.max_g_freq = 8  # 允许更高的生成器训练频率
+
+        # 判别器强度控制
+        self.d_skip_count = 0  # 跳过判别器训练的次数
+        self.max_d_skip = 5    # 最多连续跳过5次
 
         # 标签平滑参数
         self.real_label_smooth = 0.98
@@ -60,20 +77,30 @@ class DynamicGANTraining:
         return recent_d, recent_g
 
     def should_train_discriminator(self):
-        """判断是否应该训练判别器"""
+        """判断是否应该训练判别器（增强版）"""
         if len(self.d_loss_history) == 0:
+            self.d_skip_count = 0
             return True
 
         recent_d, recent_g = self.get_recent_avg_loss()
 
-        # 如果判别器过强，减少训练
+        # 如果判别器过强，减少训练（但不能连续跳过太多次）
         if recent_d < self.d_strong_threshold and recent_g > self.g_weak_threshold:
-            return False
+            if self.d_skip_count < self.max_d_skip:
+                self.d_skip_count += 1
+                return False
+            else:
+                # 已经跳过太多次，强制训练一次后重置计数
+                self.d_skip_count = 0
+                return True
 
-        # 如果生成器太强，增加判别器训练
+        # 如果生成器太强，必须训练判别器
         if recent_d > 0.7 and recent_g < 0.4:
+            self.d_skip_count = 0
             return True
 
+        # 正常情况下训练，重置跳过计数
+        self.d_skip_count = 0
         return True
 
     def adjust_training_frequency(self, epoch):
@@ -179,6 +206,71 @@ class DynamicGANTraining:
 
         return labels.requires_grad_(False)
 
+    def get_curriculum_weight(self, epoch, weight_type='detail'):
+        """
+        渐进增加任务难度的权重调度
+        Args:
+            epoch: 当前epoch
+            weight_type: 'detail' 或 'physics'
+        Returns:
+            当前epoch对应的权重
+        """
+        if weight_type == 'detail':
+            initial_weight = self.initial_detail_weight
+            final_weight = self.final_detail_weight
+        elif weight_type == 'physics':
+            initial_weight = self.initial_physics_weight
+            final_weight = self.final_physics_weight
+        else:
+            return 1.0
+
+        # 预热阶段：使用极低权重
+        if epoch < self.warmup_epochs:
+            return initial_weight * 0.5
+
+        # 课程学习阶段：线性增加权重
+        if epoch < self.curriculum_epochs:
+            progress = (epoch - self.warmup_epochs) / (self.curriculum_epochs - self.warmup_epochs)
+            return initial_weight + progress * (final_weight - initial_weight)
+
+        # 正常训练阶段：使用最终权重
+        return final_weight
+
+    def apply_curriculum_to_loss(self, loss_dict, epoch):
+        """
+        应用课程学习策略到各种损失
+        Args:
+            loss_dict: 包含各种损失的字典
+            epoch: 当前epoch
+        Returns:
+            调整后的总损失
+        """
+        detail_weight = self.get_curriculum_weight(epoch, 'detail')
+        physics_weight = self.get_curriculum_weight(epoch, 'physics')
+
+        # 基础motion reconstruction loss - 始终全权重
+        total_loss = loss_dict.get('motion_reg_loss', 0)
+
+        # GAN loss - 渐进增加权重
+        total_loss += detail_weight * loss_dict.get('gan_loss', 0)
+
+        # 物理约束损失 - 渐进增加权重（更重要，权重更大）
+        total_loss += physics_weight * loss_dict.get('bone_loss', 0)
+        total_loss += physics_weight * loss_dict.get('angle_loss', 0)
+
+        # 时序平滑损失 - 渐进增加
+        total_loss += detail_weight * loss_dict.get('smoothness_loss', 0)
+        total_loss += detail_weight * loss_dict.get('jerk_loss', 0)
+
+        return total_loss
+
+    def should_use_mixed_precision(self, epoch):
+        """
+        判断是否应该使用混合精度训练
+        前期（预热阶段）不使用，中后期使用以加速训练
+        """
+        return epoch >= self.warmup_epochs
+
 
 # Set basic parameter
 SPEAKER = 'multi_speaker'
@@ -257,8 +349,8 @@ if __name__ == '__main__':
     print(f"-------- Using GPU Device {torch.cuda.get_device_name(0)} to Train the model --------")
     cuda = True if torch.cuda.is_available() else False
 
-    # Initialize the dynamic training strategy
-    dynamic_trainer = DynamicGANTraining(g_lr=lr/2, d_lr=lr)
+    # Initialize the curriculum/progressive training strategy
+    dynamic_trainer = CurriculumGANTraining(g_lr=lr/2, d_lr=lr)
 
     # Define loss function
     motion_reg_loss = torch.nn.L1Loss()
@@ -284,6 +376,11 @@ if __name__ == '__main__':
     # Optimizers
     optimizer_G = torch.optim.Adam(generator.parameters(), lr=lr)
     optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=lr)
+
+    # 混合精度训练 - 初始化GradScaler
+    scaler_G = GradScaler() if cuda else None
+    scaler_D = GradScaler() if cuda else None
+    print("Mixed precision training enabled with GradScaler")
 
     Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
 
@@ -327,6 +424,17 @@ if __name__ == '__main__':
         g_freq, d_freq = dynamic_trainer.adjust_training_frequency(epoch)
         dynamic_trainer.adjust_learning_rates(optimizer_G, optimizer_D, epoch)
 
+        # 打印课程学习状态
+        detail_w = dynamic_trainer.get_curriculum_weight(epoch, 'detail')
+        physics_w = dynamic_trainer.get_curriculum_weight(epoch, 'physics')
+        amp_enabled = dynamic_trainer.should_use_mixed_precision(epoch)
+        print(f"\n{'='*80}")
+        print(f"Epoch {epoch}/{n_epochs} - Curriculum Learning Status:")
+        print(f"  Detail Weight: {detail_w:.3f} | Physics Weight: {physics_w:.3f}")
+        print(f"  Mixed Precision: {'ENABLED' if amp_enabled else 'DISABLED (Warmup)'}")
+        print(f"  Training Frequency: G={g_freq}, D={d_freq}")
+        print(f"{'='*80}\n")
+
         for i, batch in enumerate(dataloader.train, 0):
             #print("Batch %d strat training" % (i))
             audio = batch['audio/log_mel_512']  # torch.Size([129, 64, 128])
@@ -345,41 +453,59 @@ if __name__ == '__main__':
             # 生成真实和虚假motion（在循环外计算，避免重复计算）
             real_motion = pos_to_motion(real_pose)
             # -----------------
-            #  Train Generator (dynamic)
+            #  Train Generator (dynamic with mixed precision)
             # -----------------
+            use_amp = cuda and dynamic_trainer.should_use_mixed_precision(epoch)
+
             for gen_step in range(g_freq):
                 optimizer_G.zero_grad()
 
-                # Using audio as generator input
-                fake_pose, internal_losses = generator(audio, real_pose=real_pose)
+                # 使用混合精度训练（预热后启用）
+                if use_amp:
+                    with autocast():
+                        # Using audio as generator input
+                        fake_pose, internal_losses = generator(audio, real_pose=real_pose)
+                        # Generate motions
+                        fake_motion = pos_to_motion(fake_pose)
+                        # discriminator
+                        fake_d, _ = discriminator(fake_motion)
 
-                # Generate motions
-                fake_motion = pos_to_motion(fake_pose)
+                        # ============ 应用课程学习策略计算生成器损失 ============
+                        loss_dict = {
+                            'motion_reg_loss': motion_reg_loss(real_motion, fake_motion),
+                            'gan_loss': lambda_gan * g_loss(fake_d, valid),
+                            'smoothness_loss': 0.1 * compute_temporal_smoothness_loss(fake_motion),
+                            'jerk_loss': 0.05 * compute_jerk_loss(fake_motion),
+                            'bone_loss': internal_losses[0] if len(internal_losses) > 0 else torch.tensor(0.0).to(device),
+                            'angle_loss': internal_losses[1] if len(internal_losses) > 1 else torch.tensor(0.0).to(device)
+                        }
+                        G_loss = dynamic_trainer.apply_curriculum_to_loss(loss_dict, epoch)
 
-                # # Generate accelerations
-                # real_acceleration = pos_to_motion(real_motion)
-                # fake_acceleration = pos_to_motion(fake_motion)
+                    # 使用scaler进行反向传播
+                    scaler_G.scale(G_loss).backward()
+                    scaler_G.step(optimizer_G)
+                    scaler_G.update()
+                else:
+                    # 标准精度训练（预热阶段）
+                    fake_pose, internal_losses = generator(audio, real_pose=real_pose)
+                    fake_motion = pos_to_motion(fake_pose)
+                    fake_d, _ = discriminator(fake_motion)
 
-                # discriminator
-                fake_d, _ = discriminator(fake_motion)
+                    loss_dict = {
+                        'motion_reg_loss': motion_reg_loss(real_motion, fake_motion),
+                        'gan_loss': lambda_gan * g_loss(fake_d, valid),
+                        'smoothness_loss': 0.1 * compute_temporal_smoothness_loss(fake_motion),
+                        'jerk_loss': 0.05 * compute_jerk_loss(fake_motion),
+                        'bone_loss': internal_losses[0] if len(internal_losses) > 0 else torch.tensor(0.0).to(device),
+                        'angle_loss': internal_losses[1] if len(internal_losses) > 1 else torch.tensor(0.0).to(device)
+                    }
+                    G_loss = dynamic_trainer.apply_curriculum_to_loss(loss_dict, epoch)
 
-                # Loss measures generator's ability to fool the discriminator
-                G_loss = motion_reg_loss(real_motion, fake_motion) + lambda_gan * g_loss(fake_d, valid)
-
-                # Add temporal smoothness loss for motion continuity
-                smoothness_loss = compute_temporal_smoothness_loss(fake_motion)
-                jerk_loss = compute_jerk_loss(fake_motion)
-                G_loss += 0.1 * smoothness_loss + 0.05 * jerk_loss
-
-                # Add internal losses (bone length and angle constraints)
-                for loss in internal_losses:
-                    G_loss += loss
-
-                G_loss.backward()
-                optimizer_G.step()
+                    G_loss.backward()
+                    optimizer_G.step()
 
             # ---------------------
-            #  Train Discriminator (Dynamic)
+            #  Train Discriminator (Dynamic with mixed precision)
             # ---------------------
             # Check whether the discriminator should be trained
             if dynamic_trainer.should_train_discriminator():
@@ -389,20 +515,38 @@ if __name__ == '__main__':
 
                     # 固定生成器输出（防止梯度干扰）
                     with torch.no_grad():
-                        fake_pose_detached, _ = generator(audio)
-                        fake_motion_detached = pos_to_motion(fake_pose_detached)
+                        if use_amp:
+                            with autocast():
+                                fake_pose_detached, _ = generator(audio)
+                                fake_motion_detached = pos_to_motion(fake_pose_detached)
+                        else:
+                            fake_pose_detached, _ = generator(audio)
+                            fake_motion_detached = pos_to_motion(fake_pose_detached)
 
+                    # 使用混合精度训练判别器
+                    if use_amp:
+                        with autocast():
+                            fake_d, _ = discriminator(fake_motion_detached.detach())
+                            real_d, _ = discriminator(real_motion)
 
-                    fake_d, _ = discriminator(fake_motion_detached.detach())
-                    real_d, _ = discriminator(real_motion)
+                            # Measure discriminator's ability to classify real from generated samples
+                            real_loss = d_loss1(real_d, valid)
+                            fake_loss = d_loss2(fake_d, fake)
+                            D_loss = real_loss + lambda_d * fake_loss
 
-                    # Measure discriminator's ability to classify real from generated samples
-                    real_loss = d_loss1(real_d, valid)
-                    fake_loss = d_loss2(fake_d, fake)
-                    D_loss = real_loss + lambda_d * fake_loss
+                        scaler_D.scale(D_loss).backward()
+                        scaler_D.step(optimizer_D)
+                        scaler_D.update()
+                    else:
+                        fake_d, _ = discriminator(fake_motion_detached.detach())
+                        real_d, _ = discriminator(real_motion)
 
-                    D_loss.backward()
-                    optimizer_D.step()
+                        real_loss = d_loss1(real_d, valid)
+                        fake_loss = d_loss2(fake_d, fake)
+                        D_loss = real_loss + lambda_d * fake_loss
+
+                        D_loss.backward()
+                        optimizer_D.step()
 
             else:
                 # Use the last time loss value, if skip the D training
@@ -415,9 +559,18 @@ if __name__ == '__main__':
 
             recent_d, recent_g = dynamic_trainer.get_recent_avg_loss()
             if i % 200 == 199:
+                # 获取课程学习权重
+                detail_weight = dynamic_trainer.get_curriculum_weight(epoch, 'detail')
+                physics_weight = dynamic_trainer.get_curriculum_weight(epoch, 'physics')
+                amp_status = "ON" if use_amp else "OFF"
+
                 print(
-                    "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f] [Recent D: %f] [Recent G: %f] [G_freq: %d] [D_freq: %d]"
-                    % (epoch, n_epochs, i + 1, total_batches, D_loss.item(), G_loss.item(), recent_d, recent_g, g_freq, d_freq)
+                    "[Epoch %d/%d] [Batch %d/%d] [D loss: %.4f] [G loss: %.4f] [Recent D: %.4f] [Recent G: %.4f]"
+                    % (epoch, n_epochs, i + 1, total_batches, D_loss.item(), G_loss.item(), recent_d, recent_g)
+                )
+                print(
+                    "  [G_freq: %d] [D_freq: %d] [Detail_W: %.2f] [Physics_W: %.2f] [AMP: %s]"
+                    % (g_freq, d_freq, detail_weight, physics_weight, amp_status)
                 )
                 g_loss_list.append(G_loss.item())
                 d_loss_list.append(D_loss.item())
