@@ -1,3 +1,4 @@
+import os
 import time
 import numpy as np
 import torch
@@ -22,23 +23,30 @@ class DynamicGANTraining:
         self.d_loss_history = []
         self.g_loss_history = []
 
-        # 动态调整参数
-        self.d_strong_threshold = 0.20  # 判别器过强阈值
-        self.g_weak_threshold = 0.80  # 生成器过弱阈值
-        self.g_strong_threshold = 0.10
+        # 动态调整参数 - 放宽阈值避免过早判定"过强"
+        self.d_strong_threshold = 0.15  # 降低判别器过强阈值 (从0.20降到0.15)
+        self.g_weak_threshold = 0.85    # 提高生成器过弱阈值 (从0.80升到0.85)
+        self.g_strong_threshold = 0.05  # 降低生成器过强阈值 (从0.10降到0.05)
 
-        # 训练频率控制
-        self.d_train_freq = 1
-        self.g_train_freq = 3
+        # 训练频率控制 - 初始更平衡的频率
+        self.d_train_freq = 2  # 增加判别器初始训练频率 (从1增加到2)
+        self.g_train_freq = 3  # 保持生成器训练频率
         self.min_d_freq = 1
-        self.max_d_freq = 2
+        self.max_d_freq = 3    # 提高最大判别器训练频率 (从2提高到3)
         self.min_g_freq = 2
         self.max_g_freq = 6
 
-        # 标签平滑参数
-        self.real_label_smooth = 0.98
-        self.fake_label_smooth = 0.02
-        self.dynamic_smooth = False
+        # 标签平滑参数 - 减少标签平滑效果
+        self.real_label_smooth = 0.95  # 降低真实标签平滑 (从0.98降到0.95)
+        self.fake_label_smooth = 0.05  # 提高假标签平滑 (从0.02升到0.05)
+        self.dynamic_smooth = True     # 启用动态平滑调整
+
+        # Early stopping 参数
+        self.best_val_g_loss = float('inf')
+        self.best_val_d_loss = float('inf')
+        self.patience = 15  # 容忍验证损失不改善的epoch数
+        self.patience_counter = 0
+        self.min_delta = 0.001  # 最小改善阈值
 
     def update_loss_history(self, d_loss, g_loss):
         """更新损失历史"""
@@ -135,12 +143,12 @@ class DynamicGANTraining:
 
     # Generate dynamic smooth labels
     def get_smooth_labels(self, epoch, batch_size, device, is_real=True):
-        # Noise annealing
-        max_noise_std = 0.01
-        min_noise_std = 0.002
+        # Noise annealing - reduced to minimize label smoothing effect
+        max_noise_std = 0.005  # Reduced from 0.01
+        min_noise_std = 0.001  # Reduced from 0.002
         anneal_start_epoch = 0  # start anneal from epoch 0
         anneal_end_epoch = 60
-        max_smooth_offset = 0.05  # extra smoothing at early stage
+        max_smooth_offset = 0.02  # Reduced from 0.05 to minimize smoothing effect
 
         if epoch < anneal_start_epoch:
             progress = 0.0
@@ -153,31 +161,65 @@ class DynamicGANTraining:
             progress = (epoch - anneal_start_epoch) / (anneal_end_epoch - anneal_start_epoch)
             base_noise_std = max_noise_std - progress * (max_noise_std - min_noise_std)
 
-        # Smooth value annealing： stronger smoothness in the early stage
-        base_real_smooth = self.real_label_smooth - max_smooth_offset * (1 - progress) if is_real else self.fake_label_smooth + max_smooth_offset * (1 - progress)
+        # Smooth value annealing: stronger smoothness in the early stage
+        # Separate calculation for real and fake labels for clarity
+        if is_real:
+            base_smooth = self.real_label_smooth - max_smooth_offset * (1 - progress)
+        else:
+            base_smooth = self.fake_label_smooth + max_smooth_offset * (1 - progress)
 
         # generate labels
         recent_d, recent_g = self.get_recent_avg_loss() if len(self.d_loss_history) >= 10 else (0.5, 0.5)
+
         if is_real:
-            smooth_val = base_real_smooth
+            smooth_val = base_smooth
             if self.dynamic_smooth and recent_d < self.d_strong_threshold:
-                smooth_val = max(0.97, smooth_val - 0.1)  # 判别器过强，增加平滑
-                noise_std = base_noise_std + 0.01  # 额外噪声
+                smooth_val = max(0.90, smooth_val - 0.05)  # Reduced smoothing: 0.90 from 0.97, 0.05 from 0.1
+                noise_std = base_noise_std + 0.005  # Reduced from 0.01
             else:
                 noise_std = base_noise_std
             labels = torch.ones(batch_size, 4, device=device).fill_(smooth_val)
             labels = torch.clamp(labels + torch.normal(0, noise_std, labels.shape, device=device), 0.85, 1.0)
         else:
-            smooth_val = base_real_smooth
+            # FIXED BUG: Now correctly using base_smooth for fake labels
+            smooth_val = base_smooth
             if self.dynamic_smooth and recent_g < self.g_strong_threshold:
-                smooth_val = min(0.03, smooth_val + 0.1)  # 生成器过强，增加假标签平滑
-                noise_std = base_noise_std + 0.01
+                smooth_val = min(0.10, smooth_val + 0.05)  # Reduced smoothing: 0.10 from 0.03, 0.05 from 0.1
+                noise_std = base_noise_std + 0.005  # Reduced from 0.01
             else:
                 noise_std = base_noise_std
             labels = torch.zeros(batch_size, 4, device=device).fill_(smooth_val)
             labels = torch.clamp(labels + torch.normal(0, noise_std, labels.shape, device=device), 0.0, 0.15)
 
         return labels.requires_grad_(False)
+
+    def check_early_stopping(self, val_g_loss, val_d_loss, epoch):
+        """
+        检查是否应该早停
+        返回: (should_stop, improved) - 是否应该停止训练, 是否有改善
+        """
+        # 计算综合验证损失（生成器损失权重更高）
+        combined_val_loss = 0.7 * val_g_loss + 0.3 * val_d_loss
+        best_combined_loss = 0.7 * self.best_val_g_loss + 0.3 * self.best_val_d_loss
+
+        # 检查是否有显著改善
+        if combined_val_loss < (best_combined_loss - self.min_delta):
+            # 有改善
+            self.best_val_g_loss = val_g_loss
+            self.best_val_d_loss = val_d_loss
+            self.patience_counter = 0
+            print(f"验证损失改善! 新的最佳 G_loss: {val_g_loss:.4f}, D_loss: {val_d_loss:.4f}")
+            return False, True
+        else:
+            # 没有改善
+            self.patience_counter += 1
+            print(f"验证损失未改善 ({self.patience_counter}/{self.patience})")
+
+            if self.patience_counter >= self.patience:
+                print(f"早停触发! {self.patience}个epoch内验证损失无改善")
+                return True, False
+
+        return False, False
 
 
 # Set basic parameter
@@ -405,10 +447,16 @@ if __name__ == '__main__':
                     optimizer_D.step()
 
             else:
-                # Use the last time loss value, if skip the D training
-                # D_loss = torch.tensor(d_loss_list[-1] if d_loss_list else 1.0)
-                D_loss = torch.tensor(d_loss_list[-1])
-                print(f"跳过判别器训练 - 判别器过强")
+                # 改进：仍然计算损失用于统计，但不更新权重
+                with torch.no_grad():
+                    fake_pose_detached, _ = generator(audio)
+                    fake_motion_detached = pos_to_motion(fake_pose_detached)
+                    fake_d, _ = discriminator(fake_motion_detached)
+                    real_d, _ = discriminator(real_motion)
+                    real_loss = d_loss1(real_d, valid)
+                    fake_loss = d_loss2(fake_d, fake)
+                    D_loss = real_loss + lambda_d * fake_loss
+                print(f"跳过判别器训练 - 判别器过强 (D_loss: {D_loss.item():.4f})")
 
             # Update the loss history
             dynamic_trainer.update_loss_history(D_loss.item(), G_loss.item())
@@ -494,6 +542,9 @@ if __name__ == '__main__':
         print(f"[Validation] Epoch {epoch}/{n_epochs} | G_loss: {val_g_loss:.4f} | D_loss: {val_d_loss:.4f}")
         print(f"  Bone Loss: {avg_bone_loss:.4f} | Angle Loss: {avg_angle_loss:.4f} | Smoothness Loss: {avg_smoothness_loss:.4f} | Jerk Loss: {avg_jerk_loss:.4f}")
 
+        # ===================== Early Stopping 检查 =====================
+        should_stop, improved = dynamic_trainer.check_early_stopping(val_g_loss, val_d_loss, epoch)
+
         # switch back to training mode
         generator.train()
         discriminator.train()
@@ -504,17 +555,19 @@ if __name__ == '__main__':
         os.makedirs(MODEL_PATH_G, exist_ok=True)
         os.makedirs(MODEL_PATH_D, exist_ok=True)
 
-        # 保存最佳模型（基于验证损失）
-        if val_g_loss < min(val_g_loss_list[:-1], default=float('inf')):
-            print(f"New best G model at epoch {epoch}, saving...")
+        # 保存最佳模型（基于early stopping的改善标志）
+        if improved:
+            print(f"New best model at epoch {epoch}, saving...")
             torch.save(generator.state_dict(), os.path.join(MODEL_PATH_G, 'Best_Gen'))
+            torch.save(discriminator.state_dict(), os.path.join(MODEL_PATH_D, 'Best_Dis'))
 
-        # 常规保存（每个epoch）
-        print('epoch ', epoch, ': ', 'saving generators')
-        torch.save(generator.state_dict(), os.path.join(MODEL_PATH_G, 'epoch_'+str(epoch)))
-        print('epoch ', epoch, ': ', 'saving discriminators')
-        torch.save(discriminator.state_dict(), os.path.join(MODEL_PATH_D, 'epoch_'+str(epoch)))
-        print('epoch ', epoch, ': ', 'saving losses')
+        # 常规保存（每5个epoch保存一次以节省空间）
+        if epoch % 5 == 0 or should_stop:
+            print('epoch ', epoch, ': ', 'saving generators')
+            torch.save(generator.state_dict(), os.path.join(MODEL_PATH_G, 'epoch_'+str(epoch)))
+            print('epoch ', epoch, ': ', 'saving discriminators')
+            torch.save(discriminator.state_dict(), os.path.join(MODEL_PATH_D, 'epoch_'+str(epoch)))
+            print('epoch ', epoch, ': ', 'saving losses')
 
         # ===================== 损失记录 =====================
         loss_dict = {
@@ -530,4 +583,10 @@ if __name__ == '__main__':
             }
         }
         torch.save(loss_dict, LOSS_PATH)  # 保存为字典格式
+
+        # ===================== Early Stopping 退出 =====================
+        if should_stop:
+            print(f"\n训练提前结束于 epoch {epoch}")
+            print(f"最佳验证损失 - G: {dynamic_trainer.best_val_g_loss:.4f}, D: {dynamic_trainer.best_val_d_loss:.4f}")
+            break
 
