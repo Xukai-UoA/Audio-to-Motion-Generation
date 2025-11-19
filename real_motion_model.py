@@ -119,6 +119,24 @@ class SelfAttention_G(nn.Module):
         )
         self.hand_logits = nn.Conv1d(out_channels, self.hand_feats, kernel_size=1, stride=1)
 
+        # 身体-手部联合注意力机制 (Body-Hand Joint Attention)
+        self.body_hand_cross_attention = nn.MultiheadAttention(
+            embed_dim=out_channels,
+            num_heads=8,
+            batch_first=True,
+            dropout=p
+        )
+        # 手部-身体反向注意力（可选，增强双向交互）
+        self.hand_body_cross_attention = nn.MultiheadAttention(
+            embed_dim=out_channels,
+            num_heads=8,
+            batch_first=True,
+            dropout=p
+        )
+        # Layer normalization for attention outputs
+        self.body_attn_norm = nn.LayerNorm(out_channels)
+        self.hand_attn_norm = nn.LayerNorm(out_channels)
+
         # Bone loss setup (as original, assuming joint_subset is defined elsewhere or here)
         self.parents = self.skeleton.parents
         self.joint_names = self.skeleton.joint_names
@@ -206,6 +224,10 @@ class SelfAttention_G(nn.Module):
         body_x = self.body_proj_out(body_x)  # [B, T, C]
         body_x = self.body_norm(body_x)
         body_x = body_x.permute(0, 2, 1)  # [B, C, T]
+
+        # 在decoder_post之前保存body特征用于交叉注意力
+        body_x_for_attention = body_x  # [B, C, T]
+
         body_x = self.body_decoder_post(body_x)
         body_out = self.body_logits(body_x)  # [B, body_feats, T]
 
@@ -258,6 +280,33 @@ class SelfAttention_G(nn.Module):
         hand_x = self.hand_proj_out(hand_x)  # [B, T, C]
         hand_x = self.hand_norm(hand_x)
         hand_x = hand_x.permute(0, 2, 1)  # [B, C, T]
+
+        # ============ 身体-手部联合注意力建模 (Body-Hand Joint Attention) ============
+        # 将身体和手部特征转换为 [B, T, C] 格式用于多头注意力
+        body_feat_t = body_x_for_attention.permute(0, 2, 1)  # [B, T, C]
+        hand_feat_t = hand_x.permute(0, 2, 1)  # [B, T, C]
+
+        # 交叉注意力：手部query，身体key/value (手部动作参考身体姿态)
+        hand_attended, _ = self.body_hand_cross_attention(
+            hand_feat_t, body_feat_t, body_feat_t
+        )
+        hand_feat_t = self.hand_attn_norm(hand_attended + hand_feat_t)  # 残差连接 + LayerNorm
+
+        # 反向交叉注意力：身体query，手部key/value (身体姿态参考手部动作)
+        body_attended, _ = self.hand_body_cross_attention(
+            body_feat_t, hand_feat_t, hand_feat_t
+        )
+        body_feat_t = self.body_attn_norm(body_attended + body_feat_t)  # 残差连接 + LayerNorm
+
+        # 转换回 [B, C, T] 格式
+        hand_x = hand_feat_t.permute(0, 2, 1)  # [B, C, T]
+        body_x_enhanced = body_feat_t.permute(0, 2, 1)  # [B, C, T]
+
+        # 使用增强后的特征进行最终解码
+        # 重新计算body_out with enhanced features
+        body_x_enhanced = self.body_decoder_post(body_x_enhanced)
+        body_out = self.body_logits(body_x_enhanced)  # [B, body_feats, T]
+
         hand_x = self.hand_decoder_post(hand_x)
         hand_out = self.hand_logits(hand_x)  # [B, hand_feats, T]
 
@@ -462,6 +511,12 @@ class SelfAttention_G(nn.Module):
 
 
 class SelfAttention_D(nn.Module):
+    """
+    WGAN-GP Discriminator (Critic)
+    - Removed all BatchNorm layers (incompatible with WGAN-GP gradient penalty)
+    - Uses LayerNorm instead for stable training
+    - Outputs real-valued scores (no sigmoid)
+    """
     def __init__(self, in_channels=104, out_channels=64, n_downsampling=2, p=0.3, groups=1, aux_classes=10, **kwargs):
         super(SelfAttention_D, self).__init__()
         # Reduced n_downsampling to 2 to prevent excessive time dimension reduction
@@ -500,55 +555,47 @@ class SelfAttention_D(nn.Module):
         self.register_buffer('body_edge_index_template', self.body_edge_index)
         self.register_buffer('hand_edge_index_template', self.hand_edge_index)
 
-        # Enhanced conv1: Simplified - removed unnecessary attention and ResBlock
-        self.conv1 = nn.Sequential(
+        # WGAN-GP Conv1: BatchNorm → LayerNorm
+        self.conv1_layers = nn.ModuleList([
             nn.Conv1d(in_channels * groups, out_channels * groups, kernel_size=4, stride=2, padding=1, groups=groups),
-            nn.BatchNorm1d(out_channels * groups),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(p=p),
-            nn.Conv1d(out_channels * groups, out_channels * groups, kernel_size=4, stride=1, padding=1, groups=groups),
-            nn.BatchNorm1d(out_channels * groups),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(p=p)
-        )
+            nn.Conv1d(out_channels * groups, out_channels * groups, kernel_size=4, stride=1, padding=1, groups=groups)
+        ])
+        self.conv1_norms = nn.ModuleList([
+            nn.LayerNorm(out_channels * groups),
+            nn.LayerNorm(out_channels * groups)
+        ])
 
-        # Enhanced conv2: Simplified with fewer layers and no attention (reduce discriminator strength)
+        # WGAN-GP Conv2: BatchNorm → LayerNorm
         self.conv2 = nn.ModuleList()
+        self.conv2_norms = nn.ModuleList()
         current_channels = out_channels * groups
         for n in range(1, n_downsampling + 1):
             ch_mul = min(2 ** n, 16)
-            self.conv2.append(nn.Sequential(
+            self.conv2.append(nn.ModuleList([
                 nn.Conv1d(current_channels, current_channels * ch_mul, kernel_size=4, stride=2, padding=1,
                           groups=groups),
-                nn.BatchNorm1d(current_channels * ch_mul),
-                nn.LeakyReLU(negative_slope=0.2),
-                nn.Dropout(p=p),
                 nn.Conv1d(current_channels * ch_mul, current_channels * ch_mul, kernel_size=4, stride=1, padding=1,
-                          groups=groups),
-                nn.BatchNorm1d(current_channels * ch_mul),
-                nn.LeakyReLU(negative_slope=0.2),
-                nn.Dropout(p=p)
-            ))
+                          groups=groups)
+            ]))
+            self.conv2_norms.append(nn.ModuleList([
+                nn.LayerNorm(current_channels * ch_mul),
+                nn.LayerNorm(current_channels * ch_mul)
+            ]))
             current_channels = current_channels * ch_mul
 
-        # Enhanced conv3: Simplified - only one attention at the end
-        self.conv3 = nn.Sequential(
+        # WGAN-GP Conv3: BatchNorm → LayerNorm
+        self.conv3_layers = nn.ModuleList([
             nn.Conv1d(current_channels, current_channels * 2, kernel_size=4, stride=1, padding=1, groups=groups),
-            nn.BatchNorm1d(current_channels * 2),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(p=p),
-
             nn.Conv1d(current_channels * 2, current_channels * 4, kernel_size=4, stride=1, padding=1, groups=groups),
-            nn.BatchNorm1d(current_channels * 4),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(p=p),
-            SelfAttention(current_channels * 4),  # 只在最后保留一个attention
-
-            nn.Conv1d(current_channels * 4, current_channels * 4, kernel_size=3, stride=1, padding=1, groups=groups),
-            nn.BatchNorm1d(current_channels * 4),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Dropout(p=p)
-        )
+            nn.Conv1d(current_channels * 4, current_channels * 4, kernel_size=3, stride=1, padding=1, groups=groups)
+        ])
+        self.conv3_norms = nn.ModuleList([
+            nn.LayerNorm(current_channels * 2),
+            nn.LayerNorm(current_channels * 4),
+            nn.LayerNorm(current_channels * 4)
+        ])
+        self.conv3_attention = SelfAttention(current_channels * 4)
+        self.current_channels_final = current_channels
 
         # Graph branches for body and hand (dual discriminators)
         self.body_proj = nn.Linear(current_channels * 4 // 2, self.num_body_joints * self.joint_feat_dim)
@@ -577,17 +624,76 @@ class SelfAttention_D(nn.Module):
         )
         self.aux_loss_fn = nn.CrossEntropyLoss()
 
+    def _expand_edge_index(self, edge_index, num_nodes, batch_size):
+        """
+        Vectorized edge index expansion for efficient batch GCN processing.
+        Avoids creating individual Data objects and using Batch.from_data_list().
+
+        Args:
+            edge_index: [2, num_edges] template edge index
+            num_nodes: number of nodes per graph
+            batch_size: number of graphs in batch
+
+        Returns:
+            Expanded edge index [2, batch_size * num_edges]
+        """
+        # Create offsets for each graph in batch
+        offsets = torch.arange(batch_size, device=edge_index.device) * num_nodes
+        offsets = offsets.view(-1, 1, 1)  # [batch_size, 1, 1]
+
+        # Expand edge_index for all graphs
+        edge_index_expanded = edge_index.unsqueeze(0) + offsets  # [batch_size, 2, num_edges]
+        edge_index_expanded = edge_index_expanded.permute(1, 0, 2).reshape(2, -1)  # [2, batch_size * num_edges]
+
+        return edge_index_expanded
+
     def forward(self, x, audio=None, aux_labels=None):
         # Input shape check and padding
         x = x.transpose(-1, -2)  # (N, pose_feats, time)
         if x.size(2) < 4:  # Ensure minimum time dimension
             x = nn.functional.pad(x, (0, 4 - x.size(2) % 4))  # Pad to nearest multiple of 4
 
-        x = self.conv1(x)
-        for layer in self.conv2:
-            x = layer(x)
+        # Conv1 with LayerNorm (WGAN-GP compatible)
+        for i, conv_layer in enumerate(self.conv1_layers):
+            x = conv_layer(x)
+            # LayerNorm: normalize over [C, T] dimensions
+            x = x.permute(0, 2, 1)  # [B, T, C]
+            x = self.conv1_norms[i](x)
+            x = x.permute(0, 2, 1)  # [B, C, T]
+            x = F.leaky_relu(x, negative_slope=0.2)
+            x = F.dropout(x, p=self.p, training=self.training)
 
-        x = self.conv3(x)  # (N, high_channels, small_time)
+        # Conv2 with LayerNorm
+        for layer_idx, (conv_layers, norm_layers) in enumerate(zip(self.conv2, self.conv2_norms)):
+            for i, conv_layer in enumerate(conv_layers):
+                x = conv_layer(x)
+                x = x.permute(0, 2, 1)  # [B, T, C]
+                x = norm_layers[i](x)
+                x = x.permute(0, 2, 1)  # [B, C, T]
+                x = F.leaky_relu(x, negative_slope=0.2)
+                x = F.dropout(x, p=self.p, training=self.training)
+
+        # Conv3 with LayerNorm and Attention
+        for i in range(2):  # First two conv layers
+            x = self.conv3_layers[i](x)
+            x = x.permute(0, 2, 1)  # [B, T, C]
+            x = self.conv3_norms[i](x)
+            x = x.permute(0, 2, 1)  # [B, C, T]
+            x = F.leaky_relu(x, negative_slope=0.2)
+            x = F.dropout(x, p=self.p, training=self.training)
+
+        # Self-attention after second conv
+        x = self.conv3_attention(x)
+
+        # Third conv layer
+        x = self.conv3_layers[2](x)
+        x = x.permute(0, 2, 1)  # [B, T, C]
+        x = self.conv3_norms[2](x)
+        x = x.permute(0, 2, 1)  # [B, C, T]
+        x = F.leaky_relu(x, negative_slope=0.2)
+        x = F.dropout(x, p=self.p, training=self.training)
+
+        # (N, high_channels, small_time)
 
 
         # Split for dual graph branches (body/hand)
@@ -595,25 +701,33 @@ class SelfAttention_D(nn.Module):
         x_body = x[:, :C // 2, :]  # Split channels for body
         x_hand = x[:, C // 2:, :]  # For hand
 
-        # Project and process body graph
-        x_body = x_body.mean(dim=2)  # Global avg pool for simplicity
-        x_body = self.body_proj(x_body)
-        x_body = x_body.view(B, self.num_body_joints, self.joint_feat_dim)
-        body_data_list = [Data(x=x_body[i], edge_index=self.body_edge_index_template) for i in range(B)]
-        body_batch = Batch.from_data_list(body_data_list)
-        x_body = self.body_gat(body_batch.x, body_batch.edge_index)
-        x_body = x_body.view(B, -1)
-        x_body = self.body_graph_out(x_body)
+        # Project and process body graph - OPTIMIZED with vectorized batch processing
+        x_body = x_body.mean(dim=2)  # Global avg pool for simplicity [B, C//2]
+        x_body = self.body_proj(x_body)  # [B, num_body_joints * joint_feat_dim]
+        x_body = x_body.view(B, self.num_body_joints, self.joint_feat_dim)  # [B, joints, feat]
 
-        # Hand graph
-        x_hand = x_hand.mean(dim=2)
-        x_hand = self.hand_proj(x_hand)
-        x_hand = x_hand.view(B, self.num_hand_joints, self.joint_feat_dim)
-        hand_data_list = [Data(x=x_hand[i], edge_index=self.hand_edge_index_template) for i in range(B)]
-        hand_batch = Batch.from_data_list(hand_data_list)
-        x_hand = self.hand_gat(hand_batch.x, hand_batch.edge_index)
-        x_hand = x_hand.view(B, -1)
-        x_hand = self.hand_graph_out(x_hand)
+        # Vectorized batch processing for body graph
+        x_body_flat = x_body.view(-1, self.joint_feat_dim)  # [B*num_body_joints, feat]
+        body_edge_expanded = self._expand_edge_index(
+            self.body_edge_index_template, self.num_body_joints, B
+        )
+        x_body_flat = self.body_gat(x_body_flat, body_edge_expanded)  # [B*num_body_joints, feat]
+        x_body = x_body_flat.view(B, -1)  # [B, num_body_joints * feat]
+        x_body = self.body_graph_out(x_body)  # [B, output_dim]
+
+        # Hand graph - OPTIMIZED with vectorized batch processing
+        x_hand = x_hand.mean(dim=2)  # [B, C//2]
+        x_hand = self.hand_proj(x_hand)  # [B, num_hand_joints * joint_feat_dim]
+        x_hand = x_hand.view(B, self.num_hand_joints, self.joint_feat_dim)  # [B, joints, feat]
+
+        # Vectorized batch processing for hand graph
+        x_hand_flat = x_hand.view(-1, self.joint_feat_dim)  # [B*num_hand_joints, feat]
+        hand_edge_expanded = self._expand_edge_index(
+            self.hand_edge_index_template, self.num_hand_joints, B
+        )
+        x_hand_flat = self.hand_gat(x_hand_flat, hand_edge_expanded)  # [B*num_hand_joints, feat]
+        x_hand = x_hand_flat.view(B, -1)  # [B, num_hand_joints * feat]
+        x_hand = self.hand_graph_out(x_hand)  # [B, output_dim]
 
         # Fuse body/hand graph outputs back
         x_graph = torch.cat([x_body, x_hand], dim=1)
