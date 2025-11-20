@@ -335,8 +335,8 @@ class UNet1D(nn.Module):
         # 只在瓶颈层保留attention - 减少计算量同时保持关键特征建模能力
         self.bottleneck_attention = SelfAttention(input_channels * 8)
 
-        # 只在最关键的上采样位置保留一个attention
-        self.up_attention = SelfAttention(input_channels * 4)  # 第一跳跃连接后
+        # 只在最关键的上采样位置保留一个attention（cat后通道数为8倍）
+        self.up_attention = SelfAttention(input_channels * 8)  # 第一跳跃连接后，处理cat后的8倍通道
 
     def forward(self, x):
         # input_shape: (batch_size=256, input_channels=256, time_step=64)
