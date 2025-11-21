@@ -35,27 +35,27 @@ class CurriculumGANTraining:
         self.d_loss_history = []
         self.g_loss_history = []
 
-        # 动态调整参数 - 更激进的平衡策略
-        self.d_strong_threshold = 0.25  # 判别器过强阈值（提高以减少误判）
-        self.g_weak_threshold = 0.75  # 生成器过弱阈值
-        self.g_strong_threshold = 0.12
+        # 动态调整参数 - 融合基准分支的严格策略
+        self.d_strong_threshold = 0.08  # 基准分支的严格阈值 (从0.25→0.08)
+        self.g_weak_threshold = 0.90    # 基准分支的严格阈值 (从0.75→0.90)
+        self.g_strong_threshold = 0.03  # 基准分支的严格阈值 (从0.12→0.03)
 
-        # 训练频率控制 - 更大的调整范围
+        # 训练频率控制 - 平衡两种策略
         self.d_train_freq = 1
         self.g_train_freq = 4  # 初始增加生成器训练频率
         self.min_d_freq = 1
-        self.max_d_freq = 3  # 允许更高的判别器训练频率
+        self.max_d_freq = 2  # 基准分支的限制（从3→2）
         self.min_g_freq = 3  # 提高最小生成器训练频率
         self.max_g_freq = 8  # 允许更高的生成器训练频率
 
-        # 判别器强度控制
-        self.d_skip_count = 0  # 跳过判别器训练的次数
-        self.max_d_skip = 5    # 最多连续跳过5次
+        # 判别器强度控制 - 使用基准分支的强制训练机制
+        self.skip_d_counter = 0  # 跳过判别器训练的次数
+        self.max_skip_count = 20  # 基准分支的值（从5→20次）
 
-        # 标签平滑参数
-        self.real_label_smooth = 0.98
-        self.fake_label_smooth = 0.02
-        self.dynamic_smooth = False
+        # 标签平滑参数 - 融合基准分支的强平滑策略
+        self.real_label_smooth = 0.90  # 基准分支的强平滑 (从0.98→0.90)
+        self.fake_label_smooth = 0.10  # 基准分支的强平滑 (从0.02→0.10)
+        self.dynamic_smooth = True     # 启用动态平滑调整（基准分支）
 
     def update_loss_history(self, d_loss, g_loss):
         """更新损失历史"""
@@ -77,34 +77,41 @@ class CurriculumGANTraining:
         return recent_d, recent_g
 
     def should_train_discriminator(self):
-        """判断是否应该训练判别器（增强版）"""
+        """
+        判断是否应该训练判别器（融合版）
+        使用基准分支的严格策略 + 课程学习
+        """
         if len(self.d_loss_history) == 0:
-            self.d_skip_count = 0
+            self.skip_d_counter = 0
             return True
 
         recent_d, recent_g = self.get_recent_avg_loss()
 
-        # 如果判别器过强，减少训练（但不能连续跳过太多次）
-        if recent_d < self.d_strong_threshold and recent_g > self.g_weak_threshold:
-            if self.d_skip_count < self.max_d_skip:
-                self.d_skip_count += 1
-                return False
-            else:
-                # 已经跳过太多次，强制训练一次后重置计数
-                self.d_skip_count = 0
-                return True
-
-        # 如果生成器太强，必须训练判别器
-        if recent_d > 0.7 and recent_g < 0.4:
-            self.d_skip_count = 0
+        # 强制训练机制（基准分支）：如果连续跳过次数过多，必须训练一次
+        if self.skip_d_counter >= self.max_skip_count:
+            print(f"强制训练判别器 (连续跳过{self.skip_d_counter}次)")
+            self.skip_d_counter = 0
             return True
 
-        # 正常情况下训练，重置跳过计数
-        self.d_skip_count = 0
+        # 判别器过强的条件（基准分支的严格阈值）：D_loss < 0.08 且 G_loss > 0.90
+        if recent_d < self.d_strong_threshold and recent_g > self.g_weak_threshold:
+            self.skip_d_counter += 1
+            return False
+
+        # 如果生成器太强，增加判别器训练
+        if recent_d > 0.7 and recent_g < 0.4:
+            self.skip_d_counter = 0
+            return True
+
+        # 默认训练，重置跳过计数
+        self.skip_d_counter = 0
         return True
 
     def adjust_training_frequency(self, epoch):
-        """动态调整训练频率"""
+        """
+        动态调整训练频率（融合版）
+        使用基准分支的激进策略 + 课程学习
+        """
         if len(self.d_loss_history) < 10:
             return self.g_train_freq, self.d_train_freq
 
@@ -113,11 +120,11 @@ class CurriculumGANTraining:
         # 计算损失比值
         loss_ratio = recent_d / (recent_g + 1e-8)
 
-        # 判别器过强
-        if loss_ratio < 0.15 or recent_d < 0.1:
-            # 减少判别器训练，增加生成器训练
-            self.d_train_freq = max(1, self.d_train_freq - 1)
-            self.g_train_freq = min(self.max_g_freq, self.g_train_freq + 1)
+        # 判别器过强 - 使用基准分支的更宽松触发条件
+        if loss_ratio < 0.3 or recent_d < 0.2:
+            # 减少判别器训练，大幅增加生成器训练（基准分支策略）
+            self.d_train_freq = max(self.min_d_freq, self.d_train_freq - 1)
+            self.g_train_freq = min(self.max_g_freq, self.g_train_freq + 2)  # +2 更激进
             print(f"判别器过强，调整频率: G={self.g_train_freq}, D={self.d_train_freq}")
 
         elif loss_ratio > 2.5:  # 生成器过强
@@ -126,10 +133,18 @@ class CurriculumGANTraining:
             self.g_train_freq = max(self.min_g_freq, self.g_train_freq - 1)
             print(f"生成器过强，调整频率: G={self.g_train_freq}, D={self.d_train_freq}")
 
+        # 平衡状态（基准分支）：保持合理的训练比例
+        elif 0.5 <= loss_ratio <= 2.0 and self.g_train_freq < 4:
+            # 如果在平衡范围内，确保生成器至少训练4次
+            self.g_train_freq = min(4, self.g_train_freq + 1)
+
         return self.g_train_freq, self.d_train_freq
 
     def adjust_learning_rates(self, optimizer_g, optimizer_d, epoch):
-        """动态调整学习率"""
+        """
+        动态调整学习率（融合版）
+        使用基准分支的激进策略 + 学习率下限保护
+        """
         if len(self.d_loss_history) < 10:
             for param_group in optimizer_g.param_groups:
                 param_group['lr'] = self.g_lr_initial
@@ -138,20 +153,25 @@ class CurriculumGANTraining:
 
         else:
             recent_d, recent_g = self.get_recent_avg_loss()
+            loss_ratio = recent_d / (recent_g + 1e-8)
 
-            # 判别器过强时
-            if recent_d < self.d_strong_threshold:
-                # 降低判别器学习率，提高生成器学习率
-                self.d_lr_current *= 0.9
-                self.g_lr_current *= 1.05
-                print(f"调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
+            # 判别器过强时 - 使用基准分支的激进调整
+            if loss_ratio < 0.3 or recent_d < 0.2:
+                # 大幅降低判别器学习率，适度提高生成器学习率（基准分支策略）
+                self.d_lr_current *= 0.8  # 从0.9改为0.8，更激进
+                self.g_lr_current = min(self.g_lr_initial * 1.5, self.g_lr_current * 1.1)
+                print(f"D过强，调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
 
             # 生成器过强时
             elif recent_d > 0.65 and recent_g < 0.3:
                 # 提高判别器学习率，降低生成器学习率
-                self.d_lr_current *= 1.05
+                self.d_lr_current = min(self.d_lr_initial, self.d_lr_current * 1.1)
                 self.g_lr_current *= 0.9
-                print(f"调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
+                print(f"G过强，调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
+
+            # 设置学习率下限（基准分支）：避免过度降低
+            self.d_lr_current = max(self.d_lr_initial * 0.1, self.d_lr_current)
+            self.g_lr_current = max(self.g_lr_initial * 0.5, self.g_lr_current)
 
             # 应用新的学习率
             for param_group in optimizer_g.param_groups:
@@ -162,12 +182,16 @@ class CurriculumGANTraining:
 
     # Generate dynamic smooth labels
     def get_smooth_labels(self, epoch, batch_size, device, is_real=True):
-        # Noise annealing
-        max_noise_std = 0.01
-        min_noise_std = 0.002
-        anneal_start_epoch = 0  # start anneal from epoch 0
+        """
+        生成动态平滑标签（融合版）
+        使用基准分支的减少噪声策略 + 课程学习
+        """
+        # Noise annealing - 使用基准分支的减少噪声策略
+        max_noise_std = 0.005  # 基准分支：从0.01→0.005
+        min_noise_std = 0.001  # 基准分支：从0.002→0.001
+        anneal_start_epoch = 0
         anneal_end_epoch = 60
-        max_smooth_offset = 0.05  # extra smoothing at early stage
+        max_smooth_offset = 0.02  # 基准分支：从0.05→0.02
 
         if epoch < anneal_start_epoch:
             progress = 0.0
@@ -180,27 +204,33 @@ class CurriculumGANTraining:
             progress = (epoch - anneal_start_epoch) / (anneal_end_epoch - anneal_start_epoch)
             base_noise_std = max_noise_std - progress * (max_noise_std - min_noise_std)
 
-        # Smooth value annealing： stronger smoothness in the early stage
-        base_real_smooth = self.real_label_smooth - max_smooth_offset * (1 - progress) if is_real else self.fake_label_smooth + max_smooth_offset * (1 - progress)
-
         # generate labels
         recent_d, recent_g = self.get_recent_avg_loss() if len(self.d_loss_history) >= 10 else (0.5, 0.5)
+
         if is_real:
-            smooth_val = base_real_smooth
+            # 基准分支的策略：区分 real 和 fake 标签
+            base_smooth = self.real_label_smooth - max_smooth_offset * (1 - progress)
+            smooth_val = base_smooth
+
             if self.dynamic_smooth and recent_d < self.d_strong_threshold:
-                smooth_val = max(0.97, smooth_val - 0.1)  # 判别器过强，增加平滑
-                noise_std = base_noise_std + 0.01  # 额外噪声
+                smooth_val = max(0.90, smooth_val - 0.05)  # 基准分支：0.90, 0.05
+                noise_std = base_noise_std + 0.005  # 基准分支：从0.01→0.005
             else:
                 noise_std = base_noise_std
+
             labels = torch.ones(batch_size, 4, device=device).fill_(smooth_val)
             labels = torch.clamp(labels + torch.normal(0, noise_std, labels.shape, device=device), 0.85, 1.0)
         else:
-            smooth_val = base_real_smooth
+            # 基准分支：修复了fake标签使用正确的base_smooth
+            base_smooth = self.fake_label_smooth + max_smooth_offset * (1 - progress)
+            smooth_val = base_smooth
+
             if self.dynamic_smooth and recent_g < self.g_strong_threshold:
-                smooth_val = min(0.03, smooth_val + 0.1)  # 生成器过强，增加假标签平滑
-                noise_std = base_noise_std + 0.01
+                smooth_val = min(0.10, smooth_val + 0.05)  # 基准分支：0.10, 0.05
+                noise_std = base_noise_std + 0.005
             else:
                 noise_std = base_noise_std
+
             labels = torch.zeros(batch_size, 4, device=device).fill_(smooth_val)
             labels = torch.clamp(labels + torch.normal(0, noise_std, labels.shape, device=device), 0.0, 0.15)
 
