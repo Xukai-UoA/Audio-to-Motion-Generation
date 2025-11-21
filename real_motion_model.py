@@ -228,9 +228,6 @@ class SelfAttention_G(nn.Module):
         # 在decoder_post之前保存body特征用于交叉注意力
         body_x_for_attention = body_x  # [B, C, T]
 
-        body_x = self.body_decoder_post(body_x)
-        body_out = self.body_logits(body_x)  # [B, body_feats, T]
-
         # Hand decoding (similar optimized structure)
         hand_x = self.hand_decoder_pre(refined_feats)  # [B, C, T]
         hand_x = hand_x.permute(0, 2, 1)  # [B, T, C]
