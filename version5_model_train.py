@@ -23,23 +23,27 @@ class DynamicGANTraining:
         self.d_loss_history = []
         self.g_loss_history = []
 
-        # 动态调整参数 - 放宽阈值避免过早判定"过强"
-        self.d_strong_threshold = 0.15  # 降低判别器过强阈值 (从0.20降到0.15)
-        self.g_weak_threshold = 0.85    # 提高生成器过弱阈值 (从0.80升到0.85)
-        self.g_strong_threshold = 0.05  # 降低生成器过强阈值 (从0.10降到0.05)
+        # 动态调整参数 - 更严格的阈值避免过早判定"过强"
+        self.d_strong_threshold = 0.08  # 更严格的判别器过强阈值 (0.08意味着需要非常低才触发)
+        self.g_weak_threshold = 0.90    # 更严格的生成器过弱阈值
+        self.g_strong_threshold = 0.03  # 更严格的生成器过强阈值
 
         # 训练频率控制 - 初始更平衡的频率
-        self.d_train_freq = 2  # 增加判别器初始训练频率 (从1增加到2)
-        self.g_train_freq = 3  # 保持生成器训练频率
+        self.d_train_freq = 1  # 判别器初始训练频率
+        self.g_train_freq = 4  # 生成器训练更频繁
         self.min_d_freq = 1
-        self.max_d_freq = 3    # 提高最大判别器训练频率 (从2提高到3)
-        self.min_g_freq = 2
-        self.max_g_freq = 6
+        self.max_d_freq = 2    # 限制判别器最大训练频率
+        self.min_g_freq = 3
+        self.max_g_freq = 8    # 允许生成器更频繁训练
 
-        # 标签平滑参数 - 减少标签平滑效果
-        self.real_label_smooth = 0.95  # 降低真实标签平滑 (从0.98降到0.95)
-        self.fake_label_smooth = 0.05  # 提高假标签平滑 (从0.02升到0.05)
+        # 标签平滑参数 - 增强标签平滑以防止判别器过强
+        self.real_label_smooth = 0.90  # 更强的真实标签平滑（从0.95降到0.90）
+        self.fake_label_smooth = 0.10  # 更强的假标签平滑（从0.05升到0.10）
         self.dynamic_smooth = True     # 启用动态平滑调整
+
+        # 防止判别器过强的机制
+        self.skip_d_counter = 0  # 连续跳过判别器训练的次数
+        self.max_skip_count = 20  # 最多连续跳过20次后必须训练一次
 
         # Early stopping 参数
         self.best_val_g_loss = float('inf')
@@ -68,24 +72,41 @@ class DynamicGANTraining:
         return recent_d, recent_g
 
     def should_train_discriminator(self):
-        """判断是否应该训练判别器"""
+        """
+        判断是否应该训练判别器
+        使用更温和的策略，避免长期跳过训练导致无法恢复平衡
+        """
         if len(self.d_loss_history) == 0:
+            self.skip_d_counter = 0
             return True
 
         recent_d, recent_g = self.get_recent_avg_loss()
 
-        # 如果判别器过强，减少训练
+        # 强制训练机制：如果连续跳过次数过多，必须训练一次
+        if self.skip_d_counter >= self.max_skip_count:
+            print(f"强制训练判别器 (连续跳过{self.skip_d_counter}次)")
+            self.skip_d_counter = 0
+            return True
+
+        # 判别器过强的条件更严格：D_loss < 0.08 且 G_loss > 0.90
         if recent_d < self.d_strong_threshold and recent_g > self.g_weak_threshold:
+            self.skip_d_counter += 1
             return False
 
         # 如果生成器太强，增加判别器训练
         if recent_d > 0.7 and recent_g < 0.4:
+            self.skip_d_counter = 0
             return True
 
+        # 默认训练
+        self.skip_d_counter = 0
         return True
 
     def adjust_training_frequency(self, epoch):
-        """动态调整训练频率"""
+        """
+        动态调整训练频率
+        使用更激进的策略来防止判别器过强
+        """
         if len(self.d_loss_history) < 10:
             return self.g_train_freq, self.d_train_freq
 
@@ -94,11 +115,11 @@ class DynamicGANTraining:
         # 计算损失比值
         loss_ratio = recent_d / (recent_g + 1e-8)
 
-        # 判别器过强
-        if loss_ratio < 0.15 or recent_d < 0.1:
-            # 减少判别器训练，增加生成器训练
-            self.d_train_freq = max(1, self.d_train_freq - 1)
-            self.g_train_freq = min(self.max_g_freq, self.g_train_freq + 1)
+        # 判别器过强 - 更宽松的触发条件
+        if loss_ratio < 0.3 or recent_d < 0.2:
+            # 减少判别器训练，大幅增加生成器训练
+            self.d_train_freq = max(self.min_d_freq, self.d_train_freq - 1)
+            self.g_train_freq = min(self.max_g_freq, self.g_train_freq + 2)
             print(f"判别器过强，调整频率: G={self.g_train_freq}, D={self.d_train_freq}")
 
         elif loss_ratio > 2.5:  # 生成器过强
@@ -107,10 +128,18 @@ class DynamicGANTraining:
             self.g_train_freq = max(self.min_g_freq, self.g_train_freq - 1)
             print(f"生成器过强，调整频率: G={self.g_train_freq}, D={self.d_train_freq}")
 
+        # 平衡状态：保持合理的训练比例
+        elif 0.5 <= loss_ratio <= 2.0 and self.g_train_freq < 4:
+            # 如果在平衡范围内，确保生成器至少训练4次
+            self.g_train_freq = min(4, self.g_train_freq + 1)
+
         return self.g_train_freq, self.d_train_freq
 
     def adjust_learning_rates(self, optimizer_g, optimizer_d, epoch):
-        """动态调整学习率"""
+        """
+        动态调整学习率
+        使用更激进的策略来防止判别器过强
+        """
         if len(self.d_loss_history) < 10:
             for param_group in optimizer_g.param_groups:
                 param_group['lr'] = self.g_lr_initial
@@ -119,20 +148,25 @@ class DynamicGANTraining:
 
         else:
             recent_d, recent_g = self.get_recent_avg_loss()
+            loss_ratio = recent_d / (recent_g + 1e-8)
 
-            # 判别器过强时
-            if recent_d < self.d_strong_threshold:
-                # 降低判别器学习率，提高生成器学习率
-                self.d_lr_current *= 0.9
-                self.g_lr_current *= 1.05
-                print(f"调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
+            # 判别器过强时 - 更宽松的触发条件和更激进的调整
+            if loss_ratio < 0.3 or recent_d < 0.2:
+                # 大幅降低判别器学习率，适度提高生成器学习率
+                self.d_lr_current *= 0.8  # 从0.9改为0.8，更激进
+                self.g_lr_current = min(self.g_lr_initial * 1.5, self.g_lr_current * 1.1)
+                print(f"D过强，调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
 
             # 生成器过强时
             elif recent_d > 0.65 and recent_g < 0.3:
                 # 提高判别器学习率，降低生成器学习率
-                self.d_lr_current *= 1.05
+                self.d_lr_current = min(self.d_lr_initial, self.d_lr_current * 1.1)
                 self.g_lr_current *= 0.9
-                print(f"调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
+                print(f"G过强，调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
+
+            # 设置学习率下限，避免过度降低
+            self.d_lr_current = max(self.d_lr_initial * 0.1, self.d_lr_current)
+            self.g_lr_current = max(self.g_lr_initial * 0.5, self.g_lr_current)
 
             # 应用新的学习率
             for param_group in optimizer_g.param_groups:
@@ -299,8 +333,13 @@ if __name__ == '__main__':
     print(f"-------- Using GPU Device {torch.cuda.get_device_name(0)} to Train the model --------")
     cuda = True if torch.cuda.is_available() else False
 
+    # 设置不同的学习率以平衡GAN训练
+    # 判别器学习率设置为生成器的1/4，防止判别器过强
+    g_lr = lr  # 生成器使用完整学习率
+    d_lr = lr / 4  # 判别器使用1/4学习率（关键改动）
+
     # Initialize the dynamic training strategy
-    dynamic_trainer = DynamicGANTraining(g_lr=lr/2, d_lr=lr)
+    dynamic_trainer = DynamicGANTraining(g_lr=g_lr, d_lr=d_lr)
 
     # Define loss function
     motion_reg_loss = torch.nn.L1Loss()
@@ -313,6 +352,7 @@ if __name__ == '__main__':
     generator = SelfAttention_G()
     discriminator = SelfAttention_D(out_channels=64)
     print("Generator and Discriminator model Initialized successfully ...")
+    print(f"Learning rates - G: {g_lr:.2e}, D: {d_lr:.2e} (D/G ratio: {d_lr/g_lr:.2f})")
 
     # Move the models and loss functions on GPU
     if cuda:
@@ -323,9 +363,9 @@ if __name__ == '__main__':
         d_loss1.cuda()
         d_loss2.cuda()
 
-    # Optimizers
-    optimizer_G = torch.optim.Adam(generator.parameters(), lr=lr)
-    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=lr)
+    # Optimizers - 使用不同的学习率
+    optimizer_G = torch.optim.Adam(generator.parameters(), lr=g_lr)
+    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=d_lr)
 
     Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
 
