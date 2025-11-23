@@ -379,7 +379,8 @@ class SelfAttention_G(nn.Module):
             for i in range(len(parents)):
                 if parents[i] != -1:
                     bone_vec = pose[:, :, i, :] - pose[:, :, parents[i], :]  # [B, T, 2]
-                    bone_len = torch.norm(bone_vec, dim=-1)  # [B, T]
+                    # 添加小epsilon防止数值不稳定 (Add small epsilon for numerical stability)
+                    bone_len = torch.norm(bone_vec, dim=-1) + 1e-8  # [B, T]
                     bone_lengths.append(bone_len)
             bone_lengths = torch.stack(bone_lengths, dim=-1)  # [B, T, num_bones]
             return bone_lengths.mean(dim=1)  # 平均过时间，[B, num_bones]

@@ -73,8 +73,16 @@ class CurriculumGANTraining:
         if len(self.d_loss_history) < window:
             return np.mean(self.d_loss_history), np.mean(self.g_loss_history)
 
-        recent_d = np.mean(self.d_loss_history[-window:])
-        recent_g = np.mean(self.g_loss_history[-window:])
+        # 使用nanmean忽略NaN值，提高数值稳定性
+        recent_d = np.nanmean(self.d_loss_history[-window:])
+        recent_g = np.nanmean(self.g_loss_history[-window:])
+
+        # 如果所有值都是NaN，使用默认值
+        if np.isnan(recent_d):
+            recent_d = 1.0
+        if np.isnan(recent_g):
+            recent_g = 1.0
+
         return recent_d, recent_g
 
     def should_train_discriminator(self):
@@ -408,10 +416,12 @@ if __name__ == '__main__':
     optimizer_G = torch.optim.Adam(generator.parameters(), lr=lr)
     optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=lr)
 
-    # 混合精度训练 - 初始化GradScaler
-    scaler_G = GradScaler() if cuda else None
-    scaler_D = GradScaler() if cuda else None
-    print("Mixed precision training enabled with GradScaler")
+    # 混合精度训练 - 初始化GradScaler (使用更保守的参数防止NaN)
+    # init_scale: 初始loss scale (默认2^16, 降低到2^12更保守)
+    # growth_interval: 连续成功步数后才增加scale (默认2000, 增加到3000更保守)
+    scaler_G = GradScaler(init_scale=2.**12, growth_interval=3000) if cuda else None
+    scaler_D = GradScaler(init_scale=2.**12, growth_interval=3000) if cuda else None
+    print("Mixed precision training enabled with conservative GradScaler (init_scale=2^12)")
 
     Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
 
@@ -514,6 +524,11 @@ if __name__ == '__main__':
 
                     # 使用scaler进行反向传播
                     scaler_G.scale(G_loss).backward()
+
+                    # 梯度裁剪防止梯度爆炸 (Gradient clipping to prevent explosion)
+                    scaler_G.unscale_(optimizer_G)  # Unscale before clipping
+                    torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+
                     scaler_G.step(optimizer_G)
                     scaler_G.update()
                 else:
@@ -533,6 +548,10 @@ if __name__ == '__main__':
                     G_loss = dynamic_trainer.apply_curriculum_to_loss(loss_dict, epoch)
 
                     G_loss.backward()
+
+                    # 梯度裁剪防止梯度爆炸 (Gradient clipping to prevent explosion)
+                    torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+
                     optimizer_G.step()
 
             # ---------------------
@@ -566,6 +585,11 @@ if __name__ == '__main__':
                             D_loss = real_loss + lambda_d * fake_loss
 
                         scaler_D.scale(D_loss).backward()
+
+                        # 梯度裁剪防止梯度爆炸 (Gradient clipping to prevent explosion)
+                        scaler_D.unscale_(optimizer_D)  # Unscale before clipping
+                        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+
                         scaler_D.step(optimizer_D)
                         scaler_D.update()
                     else:
@@ -577,6 +601,10 @@ if __name__ == '__main__':
                         D_loss = real_loss + lambda_d * fake_loss
 
                         D_loss.backward()
+
+                        # 梯度裁剪防止梯度爆炸 (Gradient clipping to prevent explosion)
+                        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+
                         optimizer_D.step()
 
             else:
@@ -585,8 +613,36 @@ if __name__ == '__main__':
                 D_loss = torch.tensor(d_loss_list[-1])
                 print(f"跳过判别器训练 - 判别器过强")
 
-            # Update the loss history
-            dynamic_trainer.update_loss_history(D_loss.item(), G_loss.item())
+            # ============ NaN检测和处理 (NaN Detection and Handling) ============
+            d_loss_val = D_loss.item()
+            g_loss_val = G_loss.item()
+
+            # 检测NaN或Inf - 如果发现则跳过这个batch并发出警告
+            if torch.isnan(D_loss) or torch.isinf(D_loss) or torch.isnan(G_loss) or torch.isinf(G_loss):
+                print(f"\n{'='*80}")
+                print(f"⚠️ WARNING: NaN/Inf detected at Epoch {epoch}, Batch {i+1}")
+                print(f"  D_loss: {d_loss_val}, G_loss: {g_loss_val}")
+                print(f"  Skipping this batch and resetting gradients...")
+                print(f"{'='*80}\n")
+
+                # 清零梯度，跳过这个batch
+                optimizer_G.zero_grad()
+                optimizer_D.zero_grad()
+
+                # 不更新损失历史，使用上一次的值（如果有的话）
+                if len(d_loss_list) > 0:
+                    d_loss_val = d_loss_list[-1]
+                    g_loss_val = g_loss_list[-1]
+                else:
+                    d_loss_val = 1.0  # 初始默认值
+                    g_loss_val = 1.0
+
+                # 使用替代值更新历史
+                dynamic_trainer.update_loss_history(d_loss_val, g_loss_val)
+                continue  # 跳过这个batch
+
+            # Update the loss history (only if valid)
+            dynamic_trainer.update_loss_history(d_loss_val, g_loss_val)
 
             recent_d, recent_g = dynamic_trainer.get_recent_avg_loss()
             if i % 200 == 199:
