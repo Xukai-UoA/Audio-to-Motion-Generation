@@ -12,9 +12,32 @@ from normalization_tools import get_mean_std, get_mean_std_necksub
 
 
 class CurriculumGANTraining:
-    """渐进式/课程学习GAN训练策略类 - 继承并扩展动态训练"""
+    """
+    渐进式/课程学习GAN训练策略类
 
-    def __init__(self, g_lr=5e-6, d_lr=10e-6):
+    核心改进（基于真实训练结果）：
+    1. 学习率反转：G_lr > D_lr（D学得太快，需要限制）
+    2. 固定合理训练比例：G=2, D=1（不浪费计算资源）
+    3. 激进的学习率动态调整（而非频率调整）
+    """
+
+    def __init__(self, g_lr=1e-4, d_lr=3e-5):
+        """
+        初始化训练策略
+
+        新设计的学习率（基于epoch1训练崩溃的分析）：
+        - g_lr = 1e-4 (0.0001): 生成器学习率
+        - d_lr = 3e-5 (0.00003): 判别器学习率（是G的30%）
+
+        旧设计的问题：
+        - g_lr = 0.0005, d_lr = 0.001 (D是G的2倍！)
+        - 导致D在400 batches内崩溃（D loss: 0.0301 → 0.0022）
+
+        新设计原理：
+        - D通常比G更容易学习（分类比生成简单）
+        - D学习率应该显著低于G
+        - 通过学习率平衡，而非训练频率（更高效）
+        """
         self.g_lr_initial = g_lr
         self.d_lr_initial = d_lr
         self.g_lr_current = g_lr
@@ -36,27 +59,28 @@ class CurriculumGANTraining:
         self.d_loss_history = []
         self.g_loss_history = []
 
-        # 动态调整参数 - 融合基准分支的严格策略
-        self.d_strong_threshold = 0.08  # 基准分支的严格阈值 (从0.25→0.08)
-        self.g_weak_threshold = 0.90    # 基准分支的严格阈值 (从0.75→0.90)
-        self.g_strong_threshold = 0.03  # 基准分支的严格阈值 (从0.12→0.03)
+        # 动态调整参数
+        self.d_strong_threshold = 0.08  # D过强阈值
+        self.g_weak_threshold = 0.90    # G过弱阈值（保留兼容性，实际不太使用）
+        self.g_strong_threshold = 0.03  # G过强阈值
 
-        # 训练频率控制 - 平衡两种策略
+        # ============ 训练频率控制 - 改进版 ============
+        # 核心思想：用学习率平衡，而非极端的训练频率
         self.d_train_freq = 1
-        self.g_train_freq = 4  # 初始增加生成器训练频率
+        self.g_train_freq = 2  # 初始值：2:1比例（用户需求）
         self.min_d_freq = 1
-        self.max_d_freq = 2  # 基准分支的限制（从3→2）
-        self.min_g_freq = 3  # 提高最小生成器训练频率
-        self.max_g_freq = 8  # 允许更高的生成器训练频率
+        self.max_d_freq = 2    # D最多训练2次（不再允许更多）
+        self.min_g_freq = 2    # G最少训练2次（保持2:1比例）
+        self.max_g_freq = 3    # G最多训练3次（不再使用6, 8这种极端值）
 
-        # 判别器强度控制 - 使用基准分支的强制训练机制
+        # 判别器强度控制
         self.skip_d_counter = 0  # 跳过判别器训练的次数
-        self.max_skip_count = 20  # 基准分支的值（从5→20次）
+        self.max_skip_count = 20  # 最多连续跳过20次
 
-        # 标签平滑参数 - 融合基准分支的强平滑策略
-        self.real_label_smooth = 0.90  # 基准分支的强平滑 (从0.98→0.90)
-        self.fake_label_smooth = 0.10  # 基准分支的强平滑 (从0.02→0.10)
-        self.dynamic_smooth = True     # 启用动态平滑调整（基准分支）
+        # 标签平滑参数
+        self.real_label_smooth = 0.90  # Real标签平滑值
+        self.fake_label_smooth = 0.10  # Fake标签平滑值
+        self.dynamic_smooth = True     # 启用动态平滑调整
 
     def update_loss_history(self, d_loss, g_loss):
         """更新损失历史"""
@@ -135,8 +159,12 @@ class CurriculumGANTraining:
 
     def adjust_training_frequency(self, epoch):
         """
-        动态调整训练频率（改进版）
-        使用更激进的策略应对极端不平衡
+        动态调整训练频率（改进版 - 保守策略）
+
+        核心改进：
+        - 不再使用极端频率（6:1, 8:1）→ 只在2:1和3:1之间微调
+        - 主要依靠学习率调整来平衡G/D（更高效）
+        - 频率调整作为辅助手段
         """
         if len(self.d_loss_history) < 10:
             return self.g_train_freq, self.d_train_freq
@@ -146,46 +174,45 @@ class CurriculumGANTraining:
         # 计算损失比值
         loss_ratio = recent_d / (recent_g + 1e-8)
 
-        # ============ 极端不平衡处理（新增）============
-        # 条件1：判别器极度过强 - ratio < 0.05，直接跳到最大G频率
-        if loss_ratio < 0.05:
-            self.d_train_freq = self.min_d_freq  # D频率降到最低
-            self.g_train_freq = self.max_g_freq  # G频率升到最高
-            print(f"🚨 GAN极度失衡 (ratio={loss_ratio:.4f})，紧急调整: G={self.g_train_freq}, D={self.d_train_freq}")
+        # ============ 保守的频率调整（不浪费计算资源）============
+        # 条件1：判别器极度/严重过强 - ratio < 0.1，调到3:1
+        if loss_ratio < 0.1 or recent_d < 0.05:
+            self.d_train_freq = 1
+            self.g_train_freq = 3  # 最大值3（不再是8）
+            print(f"⚠️ 判别器严重过强 (ratio={loss_ratio:.4f}, D={recent_d:.4f})，调整频率: G=3, D=1")
 
-        # 条件2：判别器严重过强 - ratio < 0.1，激进调整
-        elif loss_ratio < 0.1 or recent_d < 0.05:
-            self.d_train_freq = self.min_d_freq  # D频率降到最低
-            self.g_train_freq = min(self.max_g_freq, self.g_train_freq + 3)  # G频率+3 (更激进)
-            print(f"⚠️ 判别器严重过强 (ratio={loss_ratio:.4f}, D={recent_d:.4f})，激进调整: G={self.g_train_freq}, D={self.d_train_freq}")
-
-        # 条件3：判别器过强 - ratio < 0.3（原有逻辑，调整更激进）
+        # 条件2：判别器过强 - ratio < 0.3，微调到2:1或3:1
         elif loss_ratio < 0.3 or recent_d < 0.2:
-            # 减少判别器训练，大幅增加生成器训练
-            self.d_train_freq = max(self.min_d_freq, self.d_train_freq - 1)
-            self.g_train_freq = min(self.max_g_freq, self.g_train_freq + 2)  # +2
-            print(f"📉 判别器过强 (ratio={loss_ratio:.4f})，调整: G={self.g_train_freq}, D={self.d_train_freq}")
+            self.d_train_freq = 1
+            # 只增加1（不再+2或+3）
+            self.g_train_freq = min(self.max_g_freq, self.g_train_freq + 1)
+            print(f"📉 判别器过强 (ratio={loss_ratio:.4f})，微调: G={self.g_train_freq}, D=1")
 
         # 生成器过强 - ratio > 2.5
         elif loss_ratio > 2.5:
-            # 增加判别器训练，减少生成器训练
+            # 可能增加D训练或减少G训练
             self.d_train_freq = min(self.max_d_freq, self.d_train_freq + 1)
             self.g_train_freq = max(self.min_g_freq, self.g_train_freq - 1)
             print(f"📈 生成器过强 (ratio={loss_ratio:.4f})，调整: G={self.g_train_freq}, D={self.d_train_freq}")
 
-        # 平衡状态：保持合理的训练比例
+        # 平衡状态：保持2:1比例
         elif 0.5 <= loss_ratio <= 2.0:
-            # 如果在平衡范围内，确保生成器至少训练4次
-            if self.g_train_freq < 4:
-                self.g_train_freq = min(4, self.g_train_freq + 1)
-                print(f"⚖️ GAN平衡 (ratio={loss_ratio:.4f})，微调: G={self.g_train_freq}, D={self.d_train_freq}")
+            # 恢复到默认2:1比例
+            if self.g_train_freq != 2:
+                self.g_train_freq = 2
+                self.d_train_freq = 1
+                print(f"⚖️ GAN平衡 (ratio={loss_ratio:.4f})，恢复2:1比例")
 
         return self.g_train_freq, self.d_train_freq
 
     def adjust_learning_rates(self, optimizer_g, optimizer_d, epoch):
         """
-        动态调整学习率（融合版）
-        使用基准分支的激进策略 + 学习率下限保护
+        动态调整学习率（改进版 - 激进策略）
+
+        核心改进：
+        - 现在主要依靠学习率来平衡G/D（不是训练频率）
+        - 更激进的调整幅度（±20-30%而非±10%）
+        - 分级响应不同程度的失衡
         """
         if len(self.d_loss_history) < 10:
             for param_group in optimizer_g.param_groups:
@@ -197,23 +224,51 @@ class CurriculumGANTraining:
             recent_d, recent_g = self.get_recent_avg_loss()
             loss_ratio = recent_d / (recent_g + 1e-8)
 
-            # 判别器过强时 - 使用基准分支的激进调整
-            if loss_ratio < 0.3 or recent_d < 0.2:
-                # 大幅降低判别器学习率，适度提高生成器学习率（基准分支策略）
-                self.d_lr_current *= 0.8  # 从0.9改为0.8，更激进
-                self.g_lr_current = min(self.g_lr_initial * 1.5, self.g_lr_current * 1.1)
-                print(f"D过强，调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
+            # ============ 激进的学习率调整（主要平衡手段）============
+            # 条件1：判别器极度过强 - ratio < 0.05，大幅调整
+            if loss_ratio < 0.05 or recent_d < 0.03:
+                # 大幅降低D学习率（-40%），大幅提高G学习率（+30%）
+                self.d_lr_current *= 0.6  # 降低40%
+                self.g_lr_current = min(self.g_lr_initial * 2.0, self.g_lr_current * 1.3)  # 提高30%，上限2倍
+                print(f"🚨 D极度过强 (ratio={loss_ratio:.4f})，大幅调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
 
-            # 生成器过强时
-            elif recent_d > 0.65 and recent_g < 0.3:
-                # 提高判别器学习率，降低生成器学习率
-                self.d_lr_current = min(self.d_lr_initial, self.d_lr_current * 1.1)
+            # 条件2：判别器严重过强 - ratio < 0.1，激进调整
+            elif loss_ratio < 0.1 or recent_d < 0.05:
+                # 显著降低D学习率（-30%），提高G学习率（+20%）
+                self.d_lr_current *= 0.7  # 降低30%
+                self.g_lr_current = min(self.g_lr_initial * 1.8, self.g_lr_current * 1.2)  # 提高20%
+                print(f"⚠️ D严重过强 (ratio={loss_ratio:.4f})，激进调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
+
+            # 条件3：判别器过强 - ratio < 0.3，常规调整
+            elif loss_ratio < 0.3 or recent_d < 0.2:
+                # 降低D学习率（-20%），提高G学习率（+10%）
+                self.d_lr_current *= 0.8  # 降低20%
+                self.g_lr_current = min(self.g_lr_initial * 1.5, self.g_lr_current * 1.1)  # 提高10%
+                print(f"📉 D过强 (ratio={loss_ratio:.4f})，调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
+
+            # 生成器过强 - ratio > 2.5
+            elif loss_ratio > 2.5 or (recent_d > 0.65 and recent_g < 0.3):
+                # 提高D学习率（+10%），降低G学习率（-10%）
+                self.d_lr_current = min(self.d_lr_initial * 1.2, self.d_lr_current * 1.1)  # 上限1.2倍初始值
                 self.g_lr_current *= 0.9
-                print(f"G过强，调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
+                print(f"📈 G过强 (ratio={loss_ratio:.4f})，调整学习率: G_lr={self.g_lr_current:.2e}, D_lr={self.d_lr_current:.2e}")
 
-            # 设置学习率下限（基准分支）：避免过度降低
-            self.d_lr_current = max(self.d_lr_initial * 0.1, self.d_lr_current)
-            self.g_lr_current = max(self.g_lr_initial * 0.5, self.g_lr_current)
+            # 平衡状态 - ratio在0.5-2.0之间，逐渐恢复到初始值
+            elif 0.5 <= loss_ratio <= 2.0:
+                # 缓慢恢复到初始学习率（每次恢复5%的差距）
+                if self.g_lr_current < self.g_lr_initial:
+                    self.g_lr_current = min(self.g_lr_initial, self.g_lr_current * 1.05)
+                elif self.g_lr_current > self.g_lr_initial:
+                    self.g_lr_current = max(self.g_lr_initial, self.g_lr_current * 0.95)
+
+                if self.d_lr_current < self.d_lr_initial:
+                    self.d_lr_current = min(self.d_lr_initial, self.d_lr_current * 1.05)
+                elif self.d_lr_current > self.d_lr_initial:
+                    self.d_lr_current = max(self.d_lr_initial, self.d_lr_current * 0.95)
+
+            # 设置学习率边界：防止过度调整
+            self.d_lr_current = max(self.d_lr_initial * 0.05, min(self.d_lr_initial * 1.5, self.d_lr_current))  # 5%-150%
+            self.g_lr_current = max(self.g_lr_initial * 0.3, min(self.g_lr_initial * 2.0, self.g_lr_current))  # 30%-200%
 
             # 应用新的学习率
             for param_group in optimizer_g.param_groups:
@@ -448,8 +503,19 @@ if __name__ == '__main__':
     print(f"-------- Using GPU Device {torch.cuda.get_device_name(0)} to Train the model --------")
     cuda = True if torch.cuda.is_available() else False
 
-    # Initialize the curriculum/progressive training strategy
-    dynamic_trainer = CurriculumGANTraining(g_lr=lr/2, d_lr=lr)
+    # ============ Initialize the curriculum/progressive training strategy ============
+    # 新设计的学习率（基于epoch1训练崩溃的分析）
+    # 旧设计：g_lr=lr/2=0.0005, d_lr=lr=0.001（D是G的2倍！导致D崩溃）
+    # 新设计：g_lr > d_lr（D学得快，需要降低D学习率）
+    lr_G = 1e-4  # 0.0001 - 生成器学习率
+    lr_D = 3e-5  # 0.00003 - 判别器学习率（是G的30%）
+    dynamic_trainer = CurriculumGANTraining(g_lr=lr_G, d_lr=lr_D)
+
+    print(f"初始学习率设置:")
+    print(f"  Generator LR: {lr_G:.2e}")
+    print(f"  Discriminator LR: {lr_D:.2e}")
+    print(f"  LR Ratio (G/D): {lr_G/lr_D:.2f}:1")
+    print(f"初始训练频率: G=2, D=1 (2:1比例，不浪费计算资源)")
 
     # Define loss function
     motion_reg_loss = torch.nn.L1Loss()
