@@ -87,8 +87,8 @@ class CurriculumGANTraining:
 
     def should_train_discriminator(self):
         """
-        判断是否应该训练判别器（融合版）
-        使用基准分支的严格策略 + 课程学习
+        判断是否应该训练判别器（改进版）
+        修复判别器过强检测逻辑，使用更合理的条件
         """
         if len(self.d_loss_history) == 0:
             self.skip_d_counter = 0
@@ -96,15 +96,32 @@ class CurriculumGANTraining:
 
         recent_d, recent_g = self.get_recent_avg_loss()
 
-        # 强制训练机制（基准分支）：如果连续跳过次数过多，必须训练一次
+        # 强制训练机制：如果连续跳过次数过多，必须训练一次
         if self.skip_d_counter >= self.max_skip_count:
-            print(f"强制训练判别器 (连续跳过{self.skip_d_counter}次)")
+            print(f"🔄 强制训练判别器 (连续跳过{self.skip_d_counter}次)")
             self.skip_d_counter = 0
             return True
 
-        # 判别器过强的条件（基准分支的严格阈值）：D_loss < 0.08 且 G_loss > 0.90
+        # ============ 改进的判别器过强检测逻辑 ============
+        # 计算损失比率（更直观的平衡指标）
+        loss_ratio = recent_d / (recent_g + 1e-8)
+
+        # 条件1：判别器极度过强 - D_loss < 0.05（极低）
+        if recent_d < 0.05:
+            self.skip_d_counter += 1
+            print(f"⚠️ 判别器极度过强 (D={recent_d:.4f} < 0.05)，跳过训练 [{self.skip_d_counter}/{self.max_skip_count}]")
+            return False
+
+        # 条件2：损失比率极端不平衡 - ratio < 0.1（判别器远强于生成器）
+        if loss_ratio < 0.1:
+            self.skip_d_counter += 1
+            print(f"⚠️ GAN严重失衡 (ratio={loss_ratio:.4f} < 0.1)，跳过判别器训练 [{self.skip_d_counter}/{self.max_skip_count}]")
+            return False
+
+        # 条件3：原有条件（兼容性保留） - D_loss < 0.08 且 G_loss > 0.90
         if recent_d < self.d_strong_threshold and recent_g > self.g_weak_threshold:
             self.skip_d_counter += 1
+            print(f"⚠️ 判别器过强 (D={recent_d:.4f}, G={recent_g:.4f})，跳过训练 [{self.skip_d_counter}/{self.max_skip_count}]")
             return False
 
         # 如果生成器太强，增加判别器训练
@@ -118,8 +135,8 @@ class CurriculumGANTraining:
 
     def adjust_training_frequency(self, epoch):
         """
-        动态调整训练频率（融合版）
-        使用基准分支的激进策略 + 课程学习
+        动态调整训练频率（改进版）
+        使用更激进的策略应对极端不平衡
         """
         if len(self.d_loss_history) < 10:
             return self.g_train_freq, self.d_train_freq
@@ -129,23 +146,39 @@ class CurriculumGANTraining:
         # 计算损失比值
         loss_ratio = recent_d / (recent_g + 1e-8)
 
-        # 判别器过强 - 使用基准分支的更宽松触发条件
-        if loss_ratio < 0.3 or recent_d < 0.2:
-            # 减少判别器训练，大幅增加生成器训练（基准分支策略）
-            self.d_train_freq = max(self.min_d_freq, self.d_train_freq - 1)
-            self.g_train_freq = min(self.max_g_freq, self.g_train_freq + 2)  # +2 更激进
-            print(f"判别器过强，调整频率: G={self.g_train_freq}, D={self.d_train_freq}")
+        # ============ 极端不平衡处理（新增）============
+        # 条件1：判别器极度过强 - ratio < 0.05，直接跳到最大G频率
+        if loss_ratio < 0.05:
+            self.d_train_freq = self.min_d_freq  # D频率降到最低
+            self.g_train_freq = self.max_g_freq  # G频率升到最高
+            print(f"🚨 GAN极度失衡 (ratio={loss_ratio:.4f})，紧急调整: G={self.g_train_freq}, D={self.d_train_freq}")
 
-        elif loss_ratio > 2.5:  # 生成器过强
+        # 条件2：判别器严重过强 - ratio < 0.1，激进调整
+        elif loss_ratio < 0.1 or recent_d < 0.05:
+            self.d_train_freq = self.min_d_freq  # D频率降到最低
+            self.g_train_freq = min(self.max_g_freq, self.g_train_freq + 3)  # G频率+3 (更激进)
+            print(f"⚠️ 判别器严重过强 (ratio={loss_ratio:.4f}, D={recent_d:.4f})，激进调整: G={self.g_train_freq}, D={self.d_train_freq}")
+
+        # 条件3：判别器过强 - ratio < 0.3（原有逻辑，调整更激进）
+        elif loss_ratio < 0.3 or recent_d < 0.2:
+            # 减少判别器训练，大幅增加生成器训练
+            self.d_train_freq = max(self.min_d_freq, self.d_train_freq - 1)
+            self.g_train_freq = min(self.max_g_freq, self.g_train_freq + 2)  # +2
+            print(f"📉 判别器过强 (ratio={loss_ratio:.4f})，调整: G={self.g_train_freq}, D={self.d_train_freq}")
+
+        # 生成器过强 - ratio > 2.5
+        elif loss_ratio > 2.5:
             # 增加判别器训练，减少生成器训练
             self.d_train_freq = min(self.max_d_freq, self.d_train_freq + 1)
             self.g_train_freq = max(self.min_g_freq, self.g_train_freq - 1)
-            print(f"生成器过强，调整频率: G={self.g_train_freq}, D={self.d_train_freq}")
+            print(f"📈 生成器过强 (ratio={loss_ratio:.4f})，调整: G={self.g_train_freq}, D={self.d_train_freq}")
 
-        # 平衡状态（基准分支）：保持合理的训练比例
-        elif 0.5 <= loss_ratio <= 2.0 and self.g_train_freq < 4:
+        # 平衡状态：保持合理的训练比例
+        elif 0.5 <= loss_ratio <= 2.0:
             # 如果在平衡范围内，确保生成器至少训练4次
-            self.g_train_freq = min(4, self.g_train_freq + 1)
+            if self.g_train_freq < 4:
+                self.g_train_freq = min(4, self.g_train_freq + 1)
+                print(f"⚖️ GAN平衡 (ratio={loss_ratio:.4f})，微调: G={self.g_train_freq}, D={self.d_train_freq}")
 
         return self.g_train_freq, self.d_train_freq
 
@@ -215,33 +248,60 @@ class CurriculumGANTraining:
 
         # generate labels
         recent_d, recent_g = self.get_recent_avg_loss() if len(self.d_loss_history) >= 10 else (0.5, 0.5)
+        loss_ratio = recent_d / (recent_g + 1e-8)
 
         if is_real:
             # 基准分支的策略：区分 real 和 fake 标签
             base_smooth = self.real_label_smooth - max_smooth_offset * (1 - progress)
             smooth_val = base_smooth
 
-            if self.dynamic_smooth and recent_d < self.d_strong_threshold:
-                smooth_val = max(0.90, smooth_val - 0.05)  # 基准分支：0.90, 0.05
-                noise_std = base_noise_std + 0.005  # 基准分支：从0.01→0.005
+            # ============ 增强的动态平滑（新增）============
+            if self.dynamic_smooth:
+                # 极端不平衡 - ratio < 0.05，使用最强平滑
+                if loss_ratio < 0.05 or recent_d < 0.03:
+                    smooth_val = 0.80  # 强平滑：1.0 → 0.80
+                    noise_std = base_noise_std + 0.01  # 增加噪声
+                # 严重不平衡 - ratio < 0.1
+                elif loss_ratio < 0.1 or recent_d < 0.05:
+                    smooth_val = max(0.85, smooth_val - 0.10)  # 0.90 → 0.85
+                    noise_std = base_noise_std + 0.008
+                # 原有逻辑 - D过强
+                elif recent_d < self.d_strong_threshold:
+                    smooth_val = max(0.90, smooth_val - 0.05)
+                    noise_std = base_noise_std + 0.005
+                else:
+                    noise_std = base_noise_std
             else:
                 noise_std = base_noise_std
 
             labels = torch.ones(batch_size, 4, device=device).fill_(smooth_val)
-            labels = torch.clamp(labels + torch.normal(0, noise_std, labels.shape, device=device), 0.85, 1.0)
+            labels = torch.clamp(labels + torch.normal(0, noise_std, labels.shape, device=device), 0.75, 1.0)  # 扩大范围
         else:
             # 基准分支：修复了fake标签使用正确的base_smooth
             base_smooth = self.fake_label_smooth + max_smooth_offset * (1 - progress)
             smooth_val = base_smooth
 
-            if self.dynamic_smooth and recent_g < self.g_strong_threshold:
-                smooth_val = min(0.10, smooth_val + 0.05)  # 基准分支：0.10, 0.05
-                noise_std = base_noise_std + 0.005
+            # ============ 增强的动态平滑（新增）============
+            if self.dynamic_smooth:
+                # 极端不平衡 - 给fake标签更高值，迷惑判别器
+                if loss_ratio < 0.05 or recent_d < 0.03:
+                    smooth_val = 0.20  # 强平滑：0.0 → 0.20
+                    noise_std = base_noise_std + 0.01
+                # 严重不平衡
+                elif loss_ratio < 0.1 or recent_d < 0.05:
+                    smooth_val = min(0.15, smooth_val + 0.10)  # 0.10 → 0.15
+                    noise_std = base_noise_std + 0.008
+                # 原有逻辑
+                elif recent_g < self.g_strong_threshold:
+                    smooth_val = min(0.10, smooth_val + 0.05)
+                    noise_std = base_noise_std + 0.005
+                else:
+                    noise_std = base_noise_std
             else:
                 noise_std = base_noise_std
 
             labels = torch.zeros(batch_size, 4, device=device).fill_(smooth_val)
-            labels = torch.clamp(labels + torch.normal(0, noise_std, labels.shape, device=device), 0.0, 0.15)
+            labels = torch.clamp(labels + torch.normal(0, noise_std, labels.shape, device=device), 0.0, 0.25)  # 扩大范围
 
         return labels.requires_grad_(False)
 
